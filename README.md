@@ -1,5 +1,7 @@
 # Sailing Simulator
 
+**[Try it live](https://sailing-simulator-alpha.vercel.app)**
+
 An interactive browser-based sailing simulator that computes and animates the fastest path around an upwind-downwind racecourse. Built from real dinghy and keelboat polar speed data and first-principles VMG (Velocity Made Good) optimization.
 
 ## What It Does
