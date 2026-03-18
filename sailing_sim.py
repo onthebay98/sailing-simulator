@@ -641,10 +641,13 @@ function makeBounds(pts) {
     if (x < xMin) xMin = x; if (x > xMax) xMax = x;
     if (y < yMin) yMin = y; if (y > yMax) yMax = y;
   }
-  const pad = 0.2;
-  const maxRange = Math.max(xMax - xMin, yMax - yMin, 0.3);
-  xMin -= maxRange * pad; xMax += maxRange * pad;
-  yMin -= maxRange * pad; yMax += maxRange * pad;
+  // Center the view: make x range symmetric around the midpoint
+  const xMid = (xMin + xMax) / 2, yMid = (yMin + yMax) / 2;
+  const halfX = (xMax - xMin) / 2, halfY = (yMax - yMin) / 2;
+  const half = Math.max(halfX, halfY, 0.15);
+  const pad = 1.3; // 30% padding
+  xMin = xMid - half * pad; xMax = xMid + half * pad;
+  yMin = yMid - half * pad; yMax = yMid + half * pad;
   const range = Math.max(xMax - xMin, yMax - yMin);
   const cw = canvas.width, ch = canvas.height;
   const drawSize = Math.min(cw, ch) * 0.85;
