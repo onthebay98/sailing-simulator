@@ -2175,26 +2175,11 @@ function startAnimation() {
   userFinishTime = userWaypoints && userWaypoints.length > 0 ? userWaypoints[userWaypoints.length-1].time : 0;
   maxTime = Math.max(optFinishTime, userFinishTime);
 
+  // Single shared clock — both boats advance at the same sim-time rate
+  timeStep = maxTime / (20 * 60);
   if (mode === 'challenge' && userFinishTime > 0) {
-    // Compressed time tracks: faster boat 20s wall, slower capped at 1.3x
-    const fasterTime = Math.min(optFinishTime, userFinishTime);
-    const slowerTime = maxTime;
-    const ratio = slowerTime / fasterTime;
-    const cappedRatio = Math.min(ratio, 1.3);
-    const fasterWall = 20 * 60;
-    const slowerWall = fasterWall * cappedRatio;
-
-    if (optFinishTime <= userFinishTime) {
-      optStep = optFinishTime / fasterWall;
-      userStep = userFinishTime / slowerWall;
-    } else {
-      userStep = userFinishTime / fasterWall;
-      optStep = optFinishTime / slowerWall;
-    }
     optElapsed = 0;
     userElapsed = 0;
-  } else {
-    timeStep = maxTime / (20 * 60);
   }
 
   btn.textContent = 'Pause';
@@ -2206,12 +2191,11 @@ function tickLoop() {
     drawFrame();
 
     if (mode === 'challenge' && userWaypoints) {
-      const optDone = optElapsed >= optFinishTime;
-      const userDone = userElapsed >= userFinishTime;
-      if (!optDone) optElapsed = Math.min(optElapsed + optStep, optFinishTime);
-      if (!userDone) userElapsed = Math.min(userElapsed + userStep, userFinishTime);
+      simElapsed = Math.min(simElapsed + timeStep, maxTime);
+      optElapsed = Math.min(simElapsed, optFinishTime);
+      userElapsed = Math.min(simElapsed, userFinishTime);
 
-      if (!optDone || !userDone) {
+      if (simElapsed < maxTime) {
         animId = requestAnimationFrame(tick);
       } else {
         drawFrame();
