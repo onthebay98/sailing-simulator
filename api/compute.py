@@ -867,8 +867,8 @@ def compute_full_course(body):
         upwind_pts = body.get("user_upwind_points", [])
         downwind_pts = body.get("user_downwind_points", [])
 
-        upwind_via = [np.array([p["x"], p["y"]]) for p in upwind_pts]
-        downwind_via = [np.array([p["x"], p["y"]]) for p in downwind_pts]
+        upwind_via = [np.array(p) for p in upwind_pts]
+        downwind_via = [np.array(p) for p in downwind_pts]
 
         u_up = compute_user_leg_spatial(
             start, mark, upwind_via, wind_field, interp,
