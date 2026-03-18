@@ -598,6 +598,18 @@ const canvas = $('sim');
 const ctx = canvas.getContext('2d');
 let waypoints = null, summary = null, frame = 0, animId = null;
 
+// --- State: 'idle' | 'running' | 'paused' | 'finished' ---
+let simState = 'idle';
+const controls = ['boat','windSpeed','windDir','startX','markY'];
+
+function setControlsEnabled(enabled) {
+  for (const id of controls) {
+    $(id).disabled = !enabled;
+  }
+  // Visual dimming
+  $('controls').style.opacity = enabled ? '1' : '0.5';
+}
+
 // --- Slider live updates + course redraw ---
 for (const [id, valId, fmt] of [
   ['windSpeed','windSpeedVal', v => v+' kts'],
@@ -607,10 +619,12 @@ for (const [id, valId, fmt] of [
 ]) {
   $(id).addEventListener('input', () => {
     $(valId).textContent = fmt($(id).value);
-    drawCourse();
+    if (simState === 'idle') drawCourse();
   });
 }
-$('boat').addEventListener('change', drawCourse);
+$('boat').addEventListener('change', () => {
+  if (simState === 'idle') drawCourse();
+});
 
 // --- Read current slider values ---
 function getParams() {
@@ -867,33 +881,48 @@ function fmtTime(s) {
   return m + ':' + String(sec).padStart(2,'0');
 }
 
-// --- Simulate / Pause / Resume button ---
-let paused = false;
+// --- Button: Simulate / Pause / Restart ---
 let stepsPerFrame = 1;
 const btn = $('simulate-btn');
 btn.addEventListener('click', handleBtn);
 
+function stopAnim() {
+  if (animId) { cancelAnimationFrame(animId); animId = null; }
+}
+
+function goIdle() {
+  stopAnim();
+  simState = 'idle';
+  waypoints = null;
+  summary = null;
+  btn.textContent = 'Simulate';
+  setControlsEnabled(true);
+  $('finish-overlay').style.opacity = '0';
+  $('summary').style.display = 'none';
+  drawCourse();
+}
+
 function handleBtn() {
-  if (animId && !paused) {
-    // Running → pause
-    cancelAnimationFrame(animId);
-    animId = null;
-    paused = true;
+  if (simState === 'idle') {
+    fetchAndRun();
+  } else if (simState === 'running') {
+    stopAnim();
+    simState = 'paused';
     btn.textContent = 'Resume';
-  } else if (paused) {
-    // Paused → resume
-    paused = false;
+  } else if (simState === 'paused') {
+    simState = 'running';
     btn.textContent = 'Pause';
     tickLoop();
-  } else {
-    // Idle → new simulation
-    fetchAndRun();
+  } else if (simState === 'finished') {
+    goIdle();
   }
 }
 
 async function fetchAndRun() {
   btn.textContent = '...';
+  btn.disabled = true;
   $('finish-overlay').style.opacity = '0';
+  setControlsEnabled(false);
   const p = getParams();
   const body = {
     boat_type: $('boat').value,
@@ -918,17 +947,19 @@ async function fetchAndRun() {
     $('s-dist').textContent = summary.total_distance_nm.toFixed(3) + ' NM';
     $('s-time').textContent = fmtTime(summary.total_time_s);
     $('s-tacks').textContent = summary.n_tacks;
+    btn.disabled = false;
     startAnimation();
   } catch(e) {
     console.error(e);
+    btn.disabled = false;
+    goIdle();
   }
 }
 
 function startAnimation() {
-  if (animId) cancelAnimationFrame(animId);
+  stopAnim();
   frame = 0;
-  paused = false;
-  $('finish-overlay').style.opacity = '0';
+  simState = 'running';
   const targetWallMs = 20000;
   stepsPerFrame = Math.max(1, Math.floor(waypoints.length / (targetWallMs / 16.67)));
   btn.textContent = 'Pause';
@@ -945,8 +976,8 @@ function tickLoop() {
       animId = requestAnimationFrame(tick);
     } else {
       animId = null;
-      paused = false;
-      btn.textContent = 'Simulate';
+      simState = 'finished';
+      btn.textContent = 'Reset';
       $('finish-overlay').textContent = 'FINISHED  ' + fmtTime(summary.total_time_s);
       $('finish-overlay').style.opacity = '1';
     }
