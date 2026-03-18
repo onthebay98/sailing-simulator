@@ -291,7 +291,7 @@ def compute_leg_path(start, target, wind_from, tws, boat_type, dt, t_offset=0.0,
 
 
 def compute_user_leg(start, via, end, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind"):
-    """Compute a user-defined two-segment leg: start -> via -> end."""
+    """Compute a user-defined two-segment leg using polar speed at actual heading."""
     interp = get_interpolator(boat_type)
     all_wps = []
     total_dist = 0.0
@@ -366,7 +366,7 @@ def compute_full_course(body):
         },
     }
 
-    # If user tack/jibe points provided, compute user path
+    # If user tack/jibe points provided, compute user path (polar speed at actual heading)
     if "user_tack_x" in body and "user_jibe_x" in body:
         user_tack = np.array([body["user_tack_x"], body["user_tack_y"]])
         user_jibe = np.array([body["user_jibe_x"], body["user_jibe_y"]])
