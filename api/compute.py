@@ -1,17 +1,25 @@
 import json
 import math
-import sys
-import os
+import hashlib
 from http.server import BaseHTTPRequestHandler
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
 # ============================================================
 # Constants
 # ============================================================
 
 KNOTS_TO_NM_PER_SEC = 1.0 / 3600.0
+
+# Maneuver penalties in seconds — cost of tacking or jibing per boat type
+MANEUVER_PENALTIES = {
+    "laser": {"tack": 6.0, "jibe": 5.0},
+    "420":   {"tack": 8.0, "jibe": 10.0},
+    "j24":   {"tack": 12.0, "jibe": 10.0},
+}
 
 # ============================================================
 # Polar Speed Data
@@ -152,7 +160,7 @@ def get_boat_speed(tws, twa_deg, interp):
 
 
 # ============================================================
-# VMG Optimizer & Path Planner
+# Helpers
 # ============================================================
 
 def normalize_angle(deg):
@@ -189,199 +197,720 @@ def find_optimal_downwind_vmg(tws, interp):
     return best_twa, best_speed, best_vmg
 
 
-def compute_tack_point(start, target, heading1_deg, heading2_deg):
-    d1 = heading_to_vector(heading1_deg)
-    d2 = heading_to_vector(heading2_deg)
-    A = np.array([[d1[0], d2[0]], [d1[1], d2[1]]])
-    b = target - start
-    det = np.linalg.det(A)
-    if abs(det) < 1e-10:
-        return np.array([np.nan, np.nan]), -1.0, -1.0
-    t = np.linalg.solve(A, b)
-    tack_point = start + t[0] * d1
-    return tack_point, float(t[0]), float(t[1])
+# ============================================================
+# Wind Field (spatially varying)
+# ============================================================
+
+def make_wind_seed(body):
+    """Deterministic seed from course parameters."""
+    parts = [
+        body.get("wind_speed", 12.0),
+        body.get("wind_direction", 0.0),
+        body.get("start_x", 0.0),
+        body.get("start_y", 0.0),
+        body.get("mark_x", 0.0),
+        body.get("mark_y", 1.0),
+        body.get("finish_x", 0.0),
+        body.get("finish_y", 0.0),
+    ]
+    key = "|".join(f"{x:.4f}" for x in parts)
+    return int(hashlib.md5(key.encode()).hexdigest()[:8], 16) % (2**31)
 
 
-def discretize_leg(start, end, heading_deg, tack, speed_kts, vmg_kts, dt, t_offset, leg):
-    dist = float(np.linalg.norm(end - start))
-    if dist < 1e-10:
+class WindField:
+    """Spatially-varying wind field using smooth sinusoidal perturbations."""
+
+    def __init__(self, base_speed, base_direction, seed=42, n_components=4):
+        self.base_speed = float(base_speed)
+        self.base_direction = float(base_direction)
+        self.n_components = n_components
+
+        rng = np.random.RandomState(seed)
+
+        # Frequency range for spatial variation (cycles per NM)
+        self.speed_freq_x = rng.uniform(2.0, 6.0, n_components)
+        self.speed_freq_y = rng.uniform(2.0, 6.0, n_components)
+        self.speed_phase_x = rng.uniform(0.0, 2.0 * np.pi, n_components)
+        self.speed_phase_y = rng.uniform(0.0, 2.0 * np.pi, n_components)
+        # Speed amplitude: +/-15-20% of base_speed, distributed across components
+        max_speed_perturb = rng.uniform(0.15, 0.20) * self.base_speed
+        self.speed_amplitudes = rng.uniform(0.3, 1.0, n_components)
+        self.speed_amplitudes *= max_speed_perturb / self.speed_amplitudes.sum()
+
+        self.dir_freq_x = rng.uniform(2.0, 6.0, n_components)
+        self.dir_freq_y = rng.uniform(2.0, 6.0, n_components)
+        self.dir_phase_x = rng.uniform(0.0, 2.0 * np.pi, n_components)
+        self.dir_phase_y = rng.uniform(0.0, 2.0 * np.pi, n_components)
+        # Direction amplitude: +/-8-15 degrees total, distributed across components
+        max_dir_perturb = rng.uniform(8.0, 15.0)
+        self.dir_amplitudes = rng.uniform(0.3, 1.0, n_components)
+        self.dir_amplitudes *= max_dir_perturb / self.dir_amplitudes.sum()
+
+    def at(self, x, y):
+        """Return (speed, direction) at a single point."""
+        speed_perturb = 0.0
+        dir_perturb = 0.0
+        for k in range(self.n_components):
+            speed_perturb += self.speed_amplitudes[k] * (
+                math.sin(self.speed_freq_x[k] * x + self.speed_phase_x[k]) *
+                math.sin(self.speed_freq_y[k] * y + self.speed_phase_y[k])
+            )
+            dir_perturb += self.dir_amplitudes[k] * (
+                math.sin(self.dir_freq_x[k] * x + self.dir_phase_x[k]) *
+                math.sin(self.dir_freq_y[k] * y + self.dir_phase_y[k])
+            )
+        speed = max(3.0, self.base_speed + speed_perturb)
+        direction = (self.base_direction + dir_perturb) % 360.0
+        return speed, direction
+
+    def at_array(self, x_arr, y_arr):
+        """Vectorized version for arrays of points. Returns (speeds, directions)."""
+        x_arr = np.asarray(x_arr, dtype=float)
+        y_arr = np.asarray(y_arr, dtype=float)
+        speed_perturb = np.zeros_like(x_arr)
+        dir_perturb = np.zeros_like(x_arr)
+        for k in range(self.n_components):
+            speed_perturb += self.speed_amplitudes[k] * (
+                np.sin(self.speed_freq_x[k] * x_arr + self.speed_phase_x[k]) *
+                np.sin(self.speed_freq_y[k] * y_arr + self.speed_phase_y[k])
+            )
+            dir_perturb += self.dir_amplitudes[k] * (
+                np.sin(self.dir_freq_x[k] * x_arr + self.dir_phase_x[k]) *
+                np.sin(self.dir_freq_y[k] * y_arr + self.dir_phase_y[k])
+            )
+        speeds = np.maximum(3.0, self.base_speed + speed_perturb)
+        directions = (self.base_direction + dir_perturb) % 360.0
+        return speeds, directions
+
+    def get_grid(self, x_min, x_max, y_min, y_max, n=12):
+        """Generate a visualization grid of wind data."""
+        xs = np.linspace(x_min, x_max, n)
+        ys = np.linspace(y_min, y_max, n)
+        grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')
+        speeds, directions = self.at_array(grid_x.ravel(), grid_y.ravel())
+        speeds_2d = speeds.reshape(n, n)
+        directions_2d = directions.reshape(n, n)
+        return {
+            "x_min": float(x_min),
+            "x_max": float(x_max),
+            "y_min": float(y_min),
+            "y_max": float(y_max),
+            "nx": n,
+            "ny": n,
+            "speeds": speeds_2d.tolist(),
+            "directions": directions_2d.tolist(),
+        }
+
+
+# ============================================================
+# Grid-based Dijkstra Pathfinder
+# ============================================================
+
+NEIGHBOR_OFFSETS = [
+    (0, 1), (0, -1), (1, 0), (-1, 0),          # cardinal
+    (1, 1), (1, -1), (-1, 1), (-1, -1),         # diagonal
+    (1, 2), (1, -2), (-1, 2), (-1, -2),         # knight moves
+    (2, 1), (2, -1), (-2, 1), (-2, -1),
+]
+
+GRID_SIZE = 70
+
+
+def build_grid_and_graph(course_points, wind_field, interp, boat_type="laser"):
+    """
+    Build a uniform grid covering all course points with padding,
+    then construct a sparse directed graph with edge costs = sailing time.
+
+    State: (i, j, tack) encoded as (i * grid_size + j) * 2 + tack_idx.
+    tack_idx: 0 = starboard, 1 = port.
+    Tack/jibe changes incur a time penalty.
+
+    Parameters
+    ----------
+    course_points : list of (x, y) tuples
+    wind_field : WindField
+    interp : RegularGridInterpolator for polar speeds
+    boat_type : str
+
+    Returns
+    -------
+    xs : 1D array of x coordinates
+    ys : 1D array of y coordinates
+    graph : csr_matrix (N x N) with edge costs in seconds
+    """
+    pts = np.array(course_points, dtype=float)
+    x_min_pt, y_min_pt = pts.min(axis=0)
+    x_max_pt, y_max_pt = pts.max(axis=0)
+
+    x_extent = x_max_pt - x_min_pt
+    y_extent = y_max_pt - y_min_pt
+    extent = max(x_extent, y_extent, 0.01)  # avoid zero extent
+
+    pad = 0.4 * extent
+    x_min = x_min_pt - pad
+    x_max = x_max_pt + pad
+    y_min = y_min_pt - pad
+    y_max = y_max_pt + pad
+
+    n = GRID_SIZE
+    xs = np.linspace(x_min, x_max, n)
+    ys = np.linspace(y_min, y_max, n)
+    dx = xs[1] - xs[0] if n > 1 else 1.0
+    dy = ys[1] - ys[0] if n > 1 else 1.0
+
+    penalties = MANEUVER_PENALTIES.get(boat_type, MANEUVER_PENALTIES["laser"])
+    tack_pen = penalties["tack"]
+    jibe_pen = penalties["jibe"]
+
+    rows_list = []
+    cols_list = []
+    costs_list = []
+
+    for di, dj in NEIGHBOR_OFFSETS:
+        # Determine valid source indices for this offset
+        if di >= 0:
+            i_src_start, i_src_end = 0, n - di
+        else:
+            i_src_start, i_src_end = -di, n
+        if dj >= 0:
+            j_src_start, j_src_end = 0, n - dj
+        else:
+            j_src_start, j_src_end = -dj, n
+
+        if i_src_start >= i_src_end or j_src_start >= j_src_end:
+            continue
+
+        # Build arrays of source (i, j) indices
+        i_src = np.arange(i_src_start, i_src_end)
+        j_src = np.arange(j_src_start, j_src_end)
+        ii_src, jj_src = np.meshgrid(i_src, j_src, indexing='ij')
+        ii_src = ii_src.ravel()
+        jj_src = jj_src.ravel()
+
+        ii_dst = ii_src + di
+        jj_dst = jj_src + dj
+
+        # Physical coordinates of source and destination
+        x_src = xs[ii_src]
+        y_src = ys[jj_src]
+        x_dst = xs[ii_dst]
+        y_dst = ys[jj_dst]
+
+        # Edge distance (constant for a given offset on uniform grid)
+        edge_dist = math.sqrt((di * dx) ** 2 + (dj * dy) ** 2)
+        if edge_dist < 1e-12:
+            continue
+
+        # Heading: compass bearing (0=N, 90=E)
+        heading = math.degrees(math.atan2(di * dx, dj * dy)) % 360.0
+
+        # Midpoint coordinates for wind lookup
+        mx = 0.5 * (x_src + x_dst)
+        my = 0.5 * (y_src + y_dst)
+
+        # Wind at midpoints (vectorized)
+        wind_speeds, wind_dirs = wind_field.at_array(mx, my)
+
+        # TWA: absolute angle between heading and wind direction
+        twa = np.abs(((heading - wind_dirs) % 360 + 180) % 360 - 180)
+
+        # Clamp TWA to [0, 180]
+        twa = np.clip(twa, 0.0, 180.0)
+
+        # Clamp TWS to interpolator range
+        tws_clamped = np.clip(wind_speeds, 6.0, 20.0)
+
+        # Boat speed from polars (vectorized)
+        pts_query = np.column_stack([tws_clamped, twa])
+        boat_speeds = interp(pts_query)
+
+        # Minimum speed floor to avoid infinite costs
+        boat_speeds = np.maximum(boat_speeds, 0.1)
+
+        # Base edge time in seconds
+        base_time = edge_dist / (boat_speeds * KNOTS_TO_NM_PER_SEC)
+
+        # Determine tack for this edge: starboard(0) if heading clockwise from wind
+        cross = ((heading - wind_dirs) % 360 + 360) % 360
+        edge_tack = np.where((cross > 0) & (cross < 180), 0, 1).astype(int)
+
+        # Penalty depends on whether this is a tack (upwind) or jibe (downwind)
+        maneuver_cost = np.where(twa < 90, tack_pen, jibe_pen)
+
+        # Base spatial node IDs: base_id = i * n + j
+        base_src = ii_src * n + jj_src
+        base_dst = ii_dst * n + jj_dst
+
+        # Create edges for both source tack states
+        for src_tack in [0, 1]:
+            penalty = np.where(edge_tack != src_tack, maneuver_cost, 0.0)
+            total_cost = base_time + penalty
+
+            src_ids = base_src * 2 + src_tack
+            dst_ids = base_dst * 2 + edge_tack
+
+            rows_list.append(src_ids)
+            cols_list.append(dst_ids)
+            costs_list.append(total_cost)
+
+    all_rows = np.concatenate(rows_list)
+    all_cols = np.concatenate(cols_list)
+    all_costs = np.concatenate(costs_list)
+
+    total_nodes = n * n * 2
+    graph = csr_matrix((all_costs, (all_rows, all_cols)),
+                       shape=(total_nodes, total_nodes))
+
+    return xs, ys, graph
+
+
+def find_nearest_node(xs, ys, x, y):
+    """Find grid node (i, j) nearest to point (x, y)."""
+    i = int(np.argmin(np.abs(xs - x)))
+    j = int(np.argmin(np.abs(ys - y)))
+    return i, j
+
+
+def run_dijkstra(graph, xs, ys, start_xy, end_xy):
+    """
+    Run Dijkstra on the tack-state-extended graph from start to end.
+    Tries both starting tack states and both ending tack states,
+    picks the fastest overall.
+
+    Returns
+    -------
+    path : list of (x, y) tuples along the grid path
+    total_time : float, travel time in seconds
+    """
+    n = len(xs)
+    si, sj = find_nearest_node(xs, ys, start_xy[0], start_xy[1])
+    ei, ej = find_nearest_node(xs, ys, end_xy[0], end_xy[1])
+
+    base_src = si * n + sj
+    base_dst = ei * n + ej
+
+    if base_src == base_dst:
+        return [(float(xs[si]), float(ys[sj]))], 0.0
+
+    # Run Dijkstra from both start tack states
+    start_nodes = [base_src * 2 + 0, base_src * 2 + 1]
+    dist_matrix, predecessors = shortest_path(
+        graph, method='D', indices=start_nodes, return_predecessors=True
+    )
+
+    # Find best combination of start tack x end tack
+    best_cost = float('inf')
+    best_src_idx = 0
+    best_end_node = base_dst * 2
+
+    for src_idx in [0, 1]:
+        for end_tack in [0, 1]:
+            end_node = base_dst * 2 + end_tack
+            cost = dist_matrix[src_idx, end_node]
+            if cost < best_cost:
+                best_cost = cost
+                best_src_idx = src_idx
+                best_end_node = end_node
+
+    total_time = best_cost
+    src_node = start_nodes[best_src_idx]
+    pred = predecessors[best_src_idx]
+
+    if pred[best_end_node] == -9999:
+        # No path found -- fallback to straight line
+        return [tuple(start_xy), tuple(end_xy)], float('inf')
+
+    # Reconstruct path from predecessors
+    path_ids = []
+    current = best_end_node
+    while current != src_node and current >= 0 and pred[current] != -9999:
+        path_ids.append(current)
+        current = int(pred[current])
+    if current == src_node:
+        path_ids.append(src_node)
+    path_ids.reverse()
+
+    # Convert extended node IDs to coordinates (strip tack state)
+    path = []
+    for nid in path_ids:
+        spatial_id = nid // 2
+        i = spatial_id // n
+        j = spatial_id % n
+        path.append((float(xs[i]), float(ys[j])))
+
+    return path, total_time
+
+
+# ============================================================
+# Path to Waypoints Conversion
+# ============================================================
+
+def path_to_waypoints(path, wind_field, interp, t_offset, leg_name, target_xy):
+    """
+    Convert a grid path (list of (x,y)) into waypoint dicts matching the API format.
+
+    Parameters
+    ----------
+    path : list of (x, y) tuples
+    wind_field : WindField
+    interp : polar interpolator
+    t_offset : float, cumulative time offset at start
+    leg_name : str, "upwind" or "downwind"
+    target_xy : (x, y) tuple, the destination of this leg (mark or finish)
+
+    Returns
+    -------
+    waypoints : list of dicts
+    """
+    if len(path) < 2:
+        if len(path) == 1:
+            return [{
+                "x": path[0][0], "y": path[0][1],
+                "heading": 0.0, "tack": "starboard",
+                "speed": 0.0, "vmg": 0.0,
+                "time": t_offset, "leg": leg_name,
+            }]
         return []
-    speed_nm_per_s = speed_kts * KNOTS_TO_NM_PER_SEC
-    if speed_nm_per_s < 1e-10:
-        return []
-    leg_time = dist / speed_nm_per_s
-    n_steps = min(max(1, int(math.ceil(leg_time / dt))), 5000)
-    direction = (end - start) / dist
+
     waypoints = []
-    for i in range(n_steps + 1):
-        frac = min(i / n_steps, 1.0)
-        pos = start + frac * dist * direction
+    t = t_offset
+
+    for idx in range(len(path)):
+        px, py = path[idx]
+
+        if idx < len(path) - 1:
+            nx, ny = path[idx + 1]
+            dx_edge = nx - px
+            dy_edge = ny - py
+            heading = math.degrees(math.atan2(dx_edge, dy_edge)) % 360.0
+        else:
+            # Last point: reuse heading from previous edge
+            if waypoints:
+                heading = waypoints[-1]["heading"]
+            else:
+                heading = 0.0
+
+        # Local wind at this point
+        local_tws, local_wind_dir = wind_field.at(px, py)
+
+        # TWA
+        twa = abs(normalize_angle(heading - local_wind_dir))
+
+        # Speed from polars
+        speed = get_boat_speed(local_tws, twa, interp)
+        speed = max(speed, 0.1)
+
+        # VMG toward target
+        dx_to_target = target_xy[0] - px
+        dy_to_target = target_xy[1] - py
+        dist_to_target = math.sqrt(dx_to_target**2 + dy_to_target**2)
+        if dist_to_target > 1e-10:
+            bearing_to_target = math.degrees(math.atan2(dx_to_target, dy_to_target)) % 360.0
+            angle_diff = math.radians(abs(normalize_angle(heading - bearing_to_target)))
+            vmg = speed * math.cos(angle_diff)
+        else:
+            vmg = 0.0
+
+        # Tack: starboard if heading is clockwise from wind (0 < cross < 180)
+        cross = (heading - local_wind_dir) % 360.0
+        tack = "starboard" if 0 < cross < 180 else "port"
+
+        # Compute time: for edges after the first point, add travel time
+        if idx > 0:
+            prev_x, prev_y = path[idx - 1]
+            edge_dx = px - prev_x
+            edge_dy = py - prev_y
+            edge_dist = math.sqrt(edge_dx**2 + edge_dy**2)
+
+            # Use midpoint wind for time computation (matches Dijkstra cost)
+            mid_x = 0.5 * (prev_x + px)
+            mid_y = 0.5 * (prev_y + py)
+            mid_tws, mid_wind_dir = wind_field.at(mid_x, mid_y)
+            edge_heading = math.degrees(math.atan2(edge_dx, edge_dy)) % 360.0
+            mid_twa = abs(normalize_angle(edge_heading - mid_wind_dir))
+            mid_speed = get_boat_speed(mid_tws, mid_twa, interp)
+            mid_speed = max(mid_speed, 0.1)
+            edge_time = edge_dist / (mid_speed * KNOTS_TO_NM_PER_SEC)
+            t += edge_time
+
         waypoints.append({
-            "x": float(pos[0]), "y": float(pos[1]),
-            "heading": heading_deg, "tack": tack,
-            "speed": speed_kts, "vmg": vmg_kts,
-            "time": t_offset + frac * leg_time, "leg": leg,
+            "x": px,
+            "y": py,
+            "heading": round(heading, 2),
+            "tack": tack,
+            "speed": round(speed, 3),
+            "vmg": round(vmg, 3),
+            "time": round(t, 3),
+            "leg": leg_name,
         })
+
     return waypoints
 
 
-def compute_leg_path(start, target, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind"):
-    interp = get_interpolator(boat_type)
-    diff = target - start
-    target_bearing = math.degrees(math.atan2(diff[0], diff[1])) % 360
-    total_straight_dist = float(np.linalg.norm(diff))
+# ============================================================
+# User Path with Spatial Wind
+# ============================================================
 
-    if total_straight_dist < 1e-10:
-        return {"waypoints": [], "optimal_twa": 0, "optimal_vmg": 0, "optimal_speed": 0, "n_maneuvers": 0, "distance": 0}
+def compute_user_leg_spatial(start, end, via_points, wind_field, interp, t_offset, leg_name, n_samples=40):
+    """
+    Compute a user-defined multi-segment leg using spatially varying wind.
+    Samples ~n_samples points per segment for smooth time integration.
 
-    angle_off_wind = abs(normalize_angle(target_bearing - wind_from))
+    Parameters
+    ----------
+    start : np.array, start point
+    end : np.array, end point
+    via_points : list of np.array, intermediate waypoints
+    wind_field : WindField
+    interp : polar interpolator
+    t_offset : float, cumulative time offset at start
+    leg_name : str, "upwind" or "downwind"
+    n_samples : int, samples per segment
 
-    if angle_off_wind <= 90:
-        opt_twa, opt_speed, opt_vmg = find_optimal_vmg(tws, interp)
-    else:
-        opt_twa, opt_speed, opt_vmg = find_optimal_downwind_vmg(tws, interp)
-
-    starboard_heading = (wind_from + opt_twa) % 360
-    port_heading = (wind_from - opt_twa) % 360
-
-    direct_speed = get_boat_speed(tws, angle_off_wind, interp)
-    direct_time = total_straight_dist / (direct_speed * KNOTS_TO_NM_PER_SEC) if direct_speed > 1e-6 else float("inf")
-
-    tp_a, dist_a1, dist_a2 = compute_tack_point(start, target, starboard_heading, port_heading)
-    tp_b, dist_b1, dist_b2 = compute_tack_point(start, target, port_heading, starboard_heading)
-
-    path_a_valid = dist_a1 > 1e-6 and dist_a2 > 1e-6
-    path_b_valid = dist_b1 > 1e-6 and dist_b2 > 1e-6
-
-    time_a = (dist_a1 + dist_a2) / (opt_speed * KNOTS_TO_NM_PER_SEC) if path_a_valid else float("inf")
-    time_b = (dist_b1 + dist_b2) / (opt_speed * KNOTS_TO_NM_PER_SEC) if path_b_valid else float("inf")
-    best_two_time = min(time_a, time_b)
-
-    if direct_time <= best_two_time:
-        cross = normalize_angle(target_bearing - wind_from)
-        tack = "starboard" if cross > 0 else "port"
-        actual_vmg = direct_speed * math.cos(math.radians(angle_off_wind))
-        waypoints = discretize_leg(start, target, target_bearing, tack, direct_speed, abs(actual_vmg), dt, t_offset, leg_name)
-        return {
-            "waypoints": waypoints,
-            "optimal_twa": opt_twa, "optimal_vmg": opt_vmg, "optimal_speed": opt_speed,
-            "n_maneuvers": 0, "distance": total_straight_dist,
-        }
-
-    if time_a <= time_b:
-        tack_point = tp_a
-        leg1_heading, leg2_heading = starboard_heading, port_heading
-        leg1_tack, leg2_tack = "starboard", "port"
-        leg1_dist, leg2_dist = dist_a1, dist_a2
-    else:
-        tack_point = tp_b
-        leg1_heading, leg2_heading = port_heading, starboard_heading
-        leg1_tack, leg2_tack = "port", "starboard"
-        leg1_dist, leg2_dist = dist_b1, dist_b2
-
-    wp1 = discretize_leg(start, tack_point, leg1_heading, leg1_tack, opt_speed, opt_vmg, dt, t_offset, leg_name)
-    t_after = wp1[-1]["time"] if wp1 else t_offset
-    wp2 = discretize_leg(tack_point, target, leg2_heading, leg2_tack, opt_speed, opt_vmg, dt, t_after, leg_name)
-
-    return {
-        "waypoints": wp1 + wp2,
-        "optimal_twa": opt_twa, "optimal_vmg": opt_vmg, "optimal_speed": opt_speed,
-        "n_maneuvers": 1, "distance": leg1_dist + leg2_dist,
-    }
-
-
-def compute_user_leg(start, via, end, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind"):
-    """Compute a user-defined two-segment leg using polar speed at actual heading."""
-    interp = get_interpolator(boat_type)
+    Returns
+    -------
+    dict with keys: waypoints, distance, time, n_maneuvers
+    """
     all_wps = []
     total_dist = 0.0
     t = t_offset
 
-    segments = [(start, via), (via, end)]
+    nodes = [start] + via_points + [end]
+    segments = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)]
     for seg_start, seg_end in segments:
         diff = seg_end - seg_start
         dist = float(np.linalg.norm(diff))
         if dist < 1e-10:
             continue
-        heading = math.degrees(math.atan2(diff[0], diff[1])) % 360
-        twa = abs(normalize_angle(heading - wind_from))
-        speed = get_boat_speed(tws, twa, interp)
-        cross = normalize_angle(heading - wind_from)
-        tack = "starboard" if cross > 0 else "port"
-        if speed < 0.5:
-            speed = 0.5
-        vmg = speed * math.cos(math.radians(twa))
-        wps = discretize_leg(seg_start, seg_end, heading, tack, speed, abs(vmg), dt, t, leg_name)
-        if wps:
-            all_wps.extend(wps)
-            t = wps[-1]["time"]
-            total_dist += dist
+
+        heading = math.degrees(math.atan2(diff[0], diff[1])) % 360.0
+
+        for s in range(n_samples + 1):
+            frac = s / n_samples
+            px = seg_start[0] + frac * diff[0]
+            py = seg_start[1] + frac * diff[1]
+
+            # Local wind
+            local_tws, local_wind_dir = wind_field.at(px, py)
+
+            # TWA
+            twa = abs(normalize_angle(heading - local_wind_dir))
+
+            # Speed
+            speed = get_boat_speed(local_tws, twa, interp)
+            speed = max(speed, 0.1)
+
+            # Tack
+            cross = (heading - local_wind_dir) % 360.0
+            tack = "starboard" if 0 < cross < 180 else "port"
+
+            # VMG (along heading direction)
+            vmg = speed * math.cos(math.radians(twa))
+
+            # Time integration using midpoint wind
+            if s > 0:
+                step_dist = dist / n_samples
+                mid_frac = (s - 0.5) / n_samples
+                mid_x = seg_start[0] + mid_frac * diff[0]
+                mid_y = seg_start[1] + mid_frac * diff[1]
+                mid_tws, mid_wind_dir = wind_field.at(mid_x, mid_y)
+                mid_twa = abs(normalize_angle(heading - mid_wind_dir))
+                mid_speed = get_boat_speed(mid_tws, mid_twa, interp)
+                mid_speed = max(mid_speed, 0.1)
+                step_time = step_dist / (mid_speed * KNOTS_TO_NM_PER_SEC)
+                t += step_time
+
+            all_wps.append({
+                "x": float(px),
+                "y": float(py),
+                "heading": round(heading, 2),
+                "tack": tack,
+                "speed": round(speed, 3),
+                "vmg": round(abs(vmg), 3),
+                "time": round(t, 3),
+                "leg": leg_name,
+            })
+
+        total_dist += dist
 
     total_time = (all_wps[-1]["time"] - t_offset) if all_wps else 0.0
-    return {"waypoints": all_wps, "distance": total_dist, "time": total_time}
 
+    # Count actual tack/jibe changes
+    n_maneuvers = 0
+    for i in range(1, len(all_wps)):
+        if all_wps[i]["tack"] != all_wps[i - 1]["tack"]:
+            n_maneuvers += 1
+
+    return {"waypoints": all_wps, "distance": total_dist, "time": total_time, "n_maneuvers": n_maneuvers}
+
+
+# ============================================================
+# Main Course Computation
+# ============================================================
 
 def compute_full_course(body):
     boat_type = body.get("boat_type", "laser")
-    tws = body.get("wind_speed", 12.0)
-    wind_from = body.get("wind_direction", 0.0)
-    dt = 1.0
+    base_tws = body.get("wind_speed", 12.0)
+    base_wind_dir = body.get("wind_direction", 0.0)
 
     start = np.array([body.get("start_x", 0.0), body.get("start_y", 0.0)])
     mark = np.array([body.get("mark_x", 0.0), body.get("mark_y", 1.0)])
     finish = np.array([body.get("finish_x", 0.0), body.get("finish_y", 0.0)])
 
-    up = compute_leg_path(start, mark, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind")
-    t_after_up = up["waypoints"][-1]["time"] if up["waypoints"] else 0.0
-    down = compute_leg_path(mark, finish, wind_from, tws, boat_type, dt, t_offset=t_after_up, leg_name="downwind")
+    interp = get_interpolator(boat_type)
 
-    all_wps = up["waypoints"] + down["waypoints"]
-    total_dist = up["distance"] + down["distance"]
+    # Create spatially-varying wind field
+    seed = make_wind_seed(body)
+    wind_field = WindField(base_tws, base_wind_dir, seed=seed)
+
+    # Build grid and graph covering all course points
+    course_points = [
+        (float(start[0]), float(start[1])),
+        (float(mark[0]), float(mark[1])),
+        (float(finish[0]), float(finish[1])),
+    ]
+    xs, ys, graph = build_grid_and_graph(course_points, wind_field, interp, boat_type)
+
+    # Run Dijkstra: upwind (start -> mark)
+    upwind_path, upwind_time = run_dijkstra(
+        graph, xs, ys,
+        (float(start[0]), float(start[1])),
+        (float(mark[0]), float(mark[1])),
+    )
+
+    # Run Dijkstra: downwind (mark -> finish) on the SAME graph
+    downwind_path, downwind_time = run_dijkstra(
+        graph, xs, ys,
+        (float(mark[0]), float(mark[1])),
+        (float(finish[0]), float(finish[1])),
+    )
+
+    # Convert paths to waypoints
+    upwind_wps = path_to_waypoints(
+        upwind_path, wind_field, interp,
+        t_offset=0.0, leg_name="upwind",
+        target_xy=(float(mark[0]), float(mark[1])),
+    )
+
+    t_after_up = upwind_wps[-1]["time"] if upwind_wps else 0.0
+
+    downwind_wps = path_to_waypoints(
+        downwind_path, wind_field, interp,
+        t_offset=t_after_up, leg_name="downwind",
+        target_xy=(float(finish[0]), float(finish[1])),
+    )
+
+    all_wps = upwind_wps + downwind_wps
+
+    # Distances
+    def path_distance(path):
+        d = 0.0
+        for i in range(1, len(path)):
+            ddx = path[i][0] - path[i - 1][0]
+            ddy = path[i][1] - path[i - 1][1]
+            d += math.sqrt(ddx**2 + ddy**2)
+        return d
+
+    upwind_dist = path_distance(upwind_path)
+    downwind_dist = path_distance(downwind_path)
+    total_dist = upwind_dist + downwind_dist
     total_time = all_wps[-1]["time"] if all_wps else 0.0
 
-    # Compute layline headings
-    up_twa = up["optimal_twa"]
-    dn_twa = down["optimal_twa"]
+    # Count tack/jibe changes
+    def count_maneuvers(waypoints):
+        changes = 0
+        for i in range(1, len(waypoints)):
+            if waypoints[i]["tack"] != waypoints[i - 1]["tack"]:
+                changes += 1
+        return changes
+
+    n_tacks = count_maneuvers(upwind_wps)
+    n_jibes = count_maneuvers(downwind_wps)
+
+    # Compute laylines from wind at mark position (backward compat)
+    mark_tws, mark_wind_dir = wind_field.at(float(mark[0]), float(mark[1]))
+    up_twa, up_speed, up_vmg = find_optimal_vmg(mark_tws, interp)
+    dn_twa, dn_speed, dn_vmg = find_optimal_downwind_vmg(mark_tws, interp)
+
     laylines = {
-        "upwind_sb": (wind_from + up_twa) % 360,
-        "upwind_port": (wind_from - up_twa) % 360,
-        "downwind_sb": (wind_from + dn_twa) % 360,
-        "downwind_port": (wind_from - dn_twa) % 360,
+        "upwind_sb": (mark_wind_dir + up_twa) % 360,
+        "upwind_port": (mark_wind_dir - up_twa) % 360,
+        "downwind_sb": (mark_wind_dir + dn_twa) % 360,
+        "downwind_port": (mark_wind_dir - dn_twa) % 360,
     }
+
+    # Wind visualization grid
+    x_min_grid = float(xs[0])
+    x_max_grid = float(xs[-1])
+    y_min_grid = float(ys[0])
+    y_max_grid = float(ys[-1])
+    wind_grid = wind_field.get_grid(x_min_grid, x_max_grid, y_min_grid, y_max_grid, n=12)
 
     result = {
         "waypoints": all_wps,
         "summary": {
-            "total_distance_nm": total_dist,
-            "total_time_s": total_time,
-            "upwind_twa": up["optimal_twa"],
-            "upwind_vmg": up["optimal_vmg"],
-            "upwind_speed": up["optimal_speed"],
-            "n_tacks": up["n_maneuvers"],
-            "downwind_twa": down["optimal_twa"],
-            "downwind_vmg": down["optimal_vmg"],
-            "downwind_speed": down["optimal_speed"],
-            "n_jibes": down["n_maneuvers"],
+            "total_distance_nm": round(total_dist, 6),
+            "total_time_s": round(total_time, 3),
+            "upwind_twa": up_twa,
+            "upwind_vmg": round(up_vmg, 3),
+            "n_tacks": n_tacks,
+            "downwind_twa": dn_twa,
+            "downwind_vmg": round(dn_vmg, 3),
+            "n_jibes": n_jibes,
             "laylines": laylines,
         },
+        "wind_grid": wind_grid,
     }
 
-    # If user tack/jibe points provided, compute user path (polar speed at actual heading)
-    if "user_tack_x" in body and "user_jibe_x" in body:
-        user_tack = np.array([body["user_tack_x"], body["user_tack_y"]])
-        user_jibe = np.array([body["user_jibe_x"], body["user_jibe_y"]])
+    # User challenge path (multi-waypoint format)
+    if "user_upwind_points" in body or "user_downwind_points" in body:
+        upwind_pts = body.get("user_upwind_points", [])
+        downwind_pts = body.get("user_downwind_points", [])
 
-        u_up = compute_user_leg(start, user_tack, mark, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind")
+        upwind_via = [np.array([p["x"], p["y"]]) for p in upwind_pts]
+        downwind_via = [np.array([p["x"], p["y"]]) for p in downwind_pts]
+
+        u_up = compute_user_leg_spatial(
+            start, mark, upwind_via, wind_field, interp,
+            t_offset=0.0, leg_name="upwind",
+        )
         u_t_after = u_up["waypoints"][-1]["time"] if u_up["waypoints"] else 0.0
-        u_dn = compute_user_leg(mark, user_jibe, finish, wind_from, tws, boat_type, dt, t_offset=u_t_after, leg_name="downwind")
+        u_dn = compute_user_leg_spatial(
+            mark, finish, downwind_via, wind_field, interp,
+            t_offset=u_t_after, leg_name="downwind",
+        )
 
         u_all_wps = u_up["waypoints"] + u_dn["waypoints"]
         result["user_waypoints"] = u_all_wps
         result["user_summary"] = {
-            "total_distance_nm": u_up["distance"] + u_dn["distance"],
-            "total_time_s": u_all_wps[-1]["time"] if u_all_wps else 0.0,
-            "n_tacks": 1,
-            "n_jibes": 1,
+            "total_distance_nm": round(u_up["distance"] + u_dn["distance"], 6),
+            "total_time_s": round(u_all_wps[-1]["time"], 3) if u_all_wps else 0.0,
+            "n_tacks": u_up["n_maneuvers"],
+            "n_jibes": u_dn["n_maneuvers"],
+        }
+
+    # Legacy single-point format (backward compat)
+    elif "user_tack_x" in body and "user_jibe_x" in body:
+        user_tack = np.array([body["user_tack_x"], body["user_tack_y"]])
+        user_jibe = np.array([body["user_jibe_x"], body["user_jibe_y"]])
+
+        u_up = compute_user_leg_spatial(
+            start, mark, [user_tack], wind_field, interp,
+            t_offset=0.0, leg_name="upwind",
+        )
+        u_t_after = u_up["waypoints"][-1]["time"] if u_up["waypoints"] else 0.0
+        u_dn = compute_user_leg_spatial(
+            mark, finish, [user_jibe], wind_field, interp,
+            t_offset=u_t_after, leg_name="downwind",
+        )
+
+        u_all_wps = u_up["waypoints"] + u_dn["waypoints"]
+        result["user_waypoints"] = u_all_wps
+        result["user_summary"] = {
+            "total_distance_nm": round(u_up["distance"] + u_dn["distance"], 6),
+            "total_time_s": round(u_all_wps[-1]["time"], 3) if u_all_wps else 0.0,
+            "n_tacks": u_up["n_maneuvers"],
+            "n_jibes": u_dn["n_maneuvers"],
         }
 
     return result

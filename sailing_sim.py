@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import http.server
 import json
 import math
@@ -24,6 +25,8 @@ from typing import Callable
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
 
 # ============================================================
@@ -235,20 +238,80 @@ def get_boat_speed(tws: float, twa_deg: float, interp: RegularGridInterpolator) 
 
 
 # ============================================================
-# Section 4: Wind Model
+# Section 4: Spatial Wind Model
 # ============================================================
 
-def make_wind_fn(config: SimConfig) -> Callable[[float, float, float], WindState]:
-    """Return a wind function. Currently constant; future: time/position varying."""
-    constant_wind = WindState(
-        speed_kts=config.wind_speed_kts,
-        direction_deg=config.wind_direction_deg,
-    )
+def make_wind_seed(config: SimConfig) -> int:
+    """Create a deterministic seed from course parameters."""
+    parts = [config.wind_speed_kts, config.wind_direction_deg,
+             config.start_x, config.start_y,
+             config.mark_x, config.mark_y,
+             config.finish_x, config.finish_y]
+    key = "|".join(f"{x:.4f}" for x in parts)
+    return int(hashlib.md5(key.encode()).hexdigest()[:8], 16) % (2**31)
 
-    def get_wind(time: float, x: float, y: float) -> WindState:
-        return constant_wind
 
-    return get_wind
+class WindField:
+    """Spatially-varying wind field using smooth sinusoidal perturbations."""
+
+    def __init__(self, base_speed: float, base_direction: float,
+                 seed: int = 42, n_components: int = 4):
+        self.base_speed = base_speed
+        self.base_direction = base_direction
+        rng = np.random.RandomState(seed)
+
+        self.speed_freqs = rng.uniform(2.0, 6.0, size=(n_components, 2))
+        self.speed_phases = rng.uniform(0, 2 * np.pi, size=n_components)
+        self.speed_amps = rng.uniform(0.08, 0.18, size=n_components) * base_speed
+
+        self.dir_freqs = rng.uniform(2.0, 6.0, size=(n_components, 2))
+        self.dir_phases = rng.uniform(0, 2 * np.pi, size=n_components)
+        self.dir_amps = rng.uniform(3.0, 12.0, size=n_components)
+
+    def at(self, x: float, y: float) -> tuple[float, float]:
+        """Get (speed, direction) at a single point."""
+        speed = self.base_speed
+        for i in range(len(self.speed_amps)):
+            speed += self.speed_amps[i] * np.sin(
+                self.speed_freqs[i, 0] * x + self.speed_freqs[i, 1] * y + self.speed_phases[i])
+        speed = max(float(speed), 3.0)
+
+        direction = self.base_direction
+        for i in range(len(self.dir_amps)):
+            direction += self.dir_amps[i] * np.sin(
+                self.dir_freqs[i, 0] * x + self.dir_freqs[i, 1] * y + self.dir_phases[i])
+        direction = float(direction) % 360
+        return speed, direction
+
+    def at_array(self, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized: get wind at arrays of points."""
+        speed = np.full_like(x, self.base_speed, dtype=float)
+        for i in range(len(self.speed_amps)):
+            speed += self.speed_amps[i] * np.sin(
+                self.speed_freqs[i, 0] * x + self.speed_freqs[i, 1] * y + self.speed_phases[i])
+        speed = np.maximum(speed, 3.0)
+
+        direction = np.full_like(x, self.base_direction, dtype=float)
+        for i in range(len(self.dir_amps)):
+            direction += self.dir_amps[i] * np.sin(
+                self.dir_freqs[i, 0] * x + self.dir_freqs[i, 1] * y + self.dir_phases[i])
+        direction = direction % 360
+        return speed, direction
+
+    def get_grid(self, x_min: float, x_max: float,
+                 y_min: float, y_max: float, n: int = 12) -> dict:
+        """Generate a visualization grid of wind vectors."""
+        xs = np.linspace(x_min, x_max, n)
+        ys = np.linspace(y_min, y_max, n)
+        X, Y = np.meshgrid(xs, ys, indexing='ij')
+        speeds, directions = self.at_array(X.ravel(), Y.ravel())
+        return {
+            "x_min": x_min, "x_max": x_max,
+            "y_min": y_min, "y_max": y_max,
+            "nx": n, "ny": n,
+            "speeds": speeds.reshape(n, n).tolist(),
+            "directions": directions.reshape(n, n).tolist(),
+        }
 
 
 # ============================================================
@@ -329,6 +392,228 @@ def find_optimal_downwind_vmg(
             best_speed = speed
 
     return best_twa, best_speed, best_vmg
+
+
+# ============================================================
+# Section 5b: Grid-Based Optimal Path Finder
+# ============================================================
+
+NEIGHBOR_OFFSETS = [
+    (0, 1), (0, -1), (1, 0), (-1, 0),
+    (1, 1), (1, -1), (-1, 1), (-1, -1),
+    (1, 2), (1, -2), (-1, 2), (-1, -2),
+    (2, 1), (2, -1), (-2, 1), (-2, -1),
+]
+
+GRID_SIZE = 70
+
+# Maneuver penalties in seconds — cost of tacking or jibing per boat type
+MANEUVER_PENALTIES = {
+    "laser": {"tack": 6, "jibe": 5},
+    "420": {"tack": 8, "jibe": 10},
+    "j24": {"tack": 12, "jibe": 10},
+}
+
+
+def build_course_graph(
+    wind_field: WindField, interp: RegularGridInterpolator,
+    xs: np.ndarray, ys: np.ndarray, grid_size: int,
+    boat_type: str = "laser",
+) -> csr_matrix:
+    """Build directed graph with tack-state-aware edges.
+
+    State: (i, j, tack) encoded as (i * grid_size + j) * 2 + tack_idx.
+    tack_idx: 0 = starboard, 1 = port.
+    Tack/jibe changes incur a time penalty.
+    """
+    n_base = grid_size * grid_size
+    n_nodes = n_base * 2
+    all_rows, all_cols, all_costs = [], [], []
+
+    penalties = MANEUVER_PENALTIES.get(boat_type, MANEUVER_PENALTIES["laser"])
+    tack_pen = penalties["tack"]
+    jibe_pen = penalties["jibe"]
+
+    for di, dj in NEIGHBOR_OFFSETS:
+        i_lo, i_hi = max(0, -di), min(grid_size, grid_size - di)
+        j_lo, j_hi = max(0, -dj), min(grid_size, grid_size - dj)
+        if i_lo >= i_hi or j_lo >= j_hi:
+            continue
+
+        ii = np.arange(i_lo, i_hi)
+        jj = np.arange(j_lo, j_hi)
+        I, J = np.meshgrid(ii, jj, indexing='ij')
+        I_flat, J_flat = I.ravel(), J.ravel()
+        NI, NJ = I_flat + di, J_flat + dj
+
+        edge_dx = float(xs[1] - xs[0]) * di
+        edge_dy = float(ys[1] - ys[0]) * dj
+        edge_dist = math.sqrt(edge_dx**2 + edge_dy**2)
+        heading = math.degrees(math.atan2(edge_dx, edge_dy)) % 360
+
+        mid_x = (xs[I_flat] + xs[NI]) / 2
+        mid_y = (ys[J_flat] + ys[NJ]) / 2
+        ws, wd = wind_field.at_array(mid_x, mid_y)
+
+        twa = np.abs(((heading - wd) % 360 + 180) % 360 - 180)
+        ws_c = np.clip(ws, 6.0, 20.0)
+        twa_c = np.minimum(twa, 180.0)
+        speeds = interp(np.column_stack([ws_c, twa_c]))
+        speeds = np.maximum(speeds, 0.01)
+
+        base_time = edge_dist / (speeds * KNOTS_TO_NM_PER_SEC)
+
+        # Determine tack for this edge: starboard(0) if heading clockwise from wind
+        cross = ((heading - wd) % 360 + 360) % 360
+        edge_tack = np.where((cross > 0) & (cross < 180), 0, 1).astype(int)
+
+        # Penalty depends on whether this is a tack (upwind) or jibe (downwind)
+        maneuver_cost = np.where(twa < 90, tack_pen, jibe_pen)
+
+        base_src = I_flat * grid_size + J_flat
+        base_dst = NI * grid_size + NJ
+
+        # Create edges for both source tack states
+        for src_tack in [0, 1]:
+            penalty = np.where(edge_tack != src_tack, maneuver_cost, 0.0)
+            total_cost = base_time + penalty
+
+            src_ids = base_src * 2 + src_tack
+            dst_ids = base_dst * 2 + edge_tack
+
+            all_rows.append(src_ids)
+            all_cols.append(dst_ids)
+            all_costs.append(total_cost)
+
+    rows = np.concatenate(all_rows)
+    cols = np.concatenate(all_cols)
+    costs = np.concatenate(all_costs)
+    return csr_matrix((costs, (rows, cols)), shape=(n_nodes, n_nodes))
+
+
+def find_optimal_grid_path(
+    graph: csr_matrix, start_id: int, end_id: int,
+    xs: np.ndarray, ys: np.ndarray, grid_size: int,
+) -> list[tuple[float, float]]:
+    """Find shortest path on tack-state-extended graph.
+
+    Tries both starting tack states, picks the fastest overall.
+    """
+    # Run Dijkstra from both start tacks at once
+    start_nodes = [start_id * 2 + 0, start_id * 2 + 1]
+    dist, pred = shortest_path(
+        graph, method='D', indices=start_nodes, return_predecessors=True)
+
+    # Find best combination of start tack × end tack
+    best_cost = float('inf')
+    best_src_idx = 0
+    best_end_node = end_id * 2
+
+    for src_idx in [0, 1]:
+        for end_tack in [0, 1]:
+            end_node = end_id * 2 + end_tack
+            cost = dist[src_idx, end_node]
+            if cost < best_cost:
+                best_cost = cost
+                best_src_idx = src_idx
+                best_end_node = end_node
+
+    # Reconstruct path
+    src_node = start_nodes[best_src_idx]
+    predecessors = pred[best_src_idx]
+    path_ids = []
+    current = best_end_node
+    while current != src_node and current >= 0 and predecessors[current] != -9999:
+        path_ids.append(current)
+        current = int(predecessors[current])
+    if current == src_node:
+        path_ids.append(src_node)
+    path_ids.reverse()
+
+    # Convert extended node IDs to coordinates (strip tack state)
+    return [(float(xs[(nid // 2) // grid_size]), float(ys[(nid // 2) % grid_size]))
+            for nid in path_ids]
+
+
+def path_to_waypoints(
+    path: list[tuple[float, float]],
+    wind_field: WindField, interp: RegularGridInterpolator,
+    target: np.ndarray, t_offset: float, leg_name: str,
+) -> list[dict]:
+    """Convert a grid path to waypoints with timing and metadata."""
+    waypoints = []
+    t = t_offset
+
+    for k in range(len(path)):
+        x, y = path[k]
+        ws, wd = wind_field.at(x, y)
+
+        if k < len(path) - 1:
+            nx_, ny_ = path[k + 1]
+            edge_dx = nx_ - x
+            edge_dy = ny_ - y
+            edge_dist = math.sqrt(edge_dx**2 + edge_dy**2)
+            heading = math.degrees(math.atan2(edge_dx, edge_dy)) % 360
+        else:
+            if k > 0:
+                px, py = path[k - 1]
+                heading = math.degrees(math.atan2(x - px, y - py)) % 360
+            else:
+                heading = 0.0
+            edge_dist = 0.0
+
+        twa = abs(((heading - wd) % 360 + 180) % 360 - 180)
+        ws_c = max(6.0, min(20.0, ws))
+        speed = max(float(interp((ws_c, min(twa, 180.0)))), 0.1)
+
+        # VMG toward target
+        target_dx = target[0] - x
+        target_dy = target[1] - y
+        target_dist = math.sqrt(target_dx**2 + target_dy**2)
+        if target_dist > 1e-6:
+            target_bearing = math.atan2(target_dx, target_dy)
+            vmg = speed * math.cos(math.radians(heading) - target_bearing)
+        else:
+            vmg = 0.0
+
+        cross = ((heading - wd) % 360 + 360) % 360
+        tack = "starboard" if 0 < cross < 180 else "port"
+
+        waypoints.append({
+            "x": x, "y": y, "heading": heading, "tack": tack,
+            "speed": speed, "vmg": abs(vmg), "time": t, "leg": leg_name,
+        })
+
+        # Advance time using midpoint wind speed (matches Dijkstra cost)
+        if k < len(path) - 1:
+            mx = (x + path[k + 1][0]) / 2
+            my = (y + path[k + 1][1]) / 2
+            mws, mwd = wind_field.at(mx, my)
+            mtwa = abs(((heading - mwd) % 360 + 180) % 360 - 180)
+            mws_c = max(6.0, min(20.0, mws))
+            mspeed = max(float(interp((mws_c, min(mtwa, 180.0)))), 0.1)
+            t += edge_dist / (mspeed * KNOTS_TO_NM_PER_SEC)
+
+    return waypoints
+
+
+def sum_path_distance(path: list[tuple[float, float]]) -> float:
+    """Total distance along a path in NM."""
+    total = 0.0
+    for i in range(1, len(path)):
+        dx = path[i][0] - path[i - 1][0]
+        dy = path[i][1] - path[i - 1][1]
+        total += math.sqrt(dx**2 + dy**2)
+    return total
+
+
+def count_tack_changes(waypoints: list[dict]) -> int:
+    """Count the number of tack changes in a waypoint list."""
+    changes = 0
+    for i in range(1, len(waypoints)):
+        if waypoints[i]["tack"] != waypoints[i - 1]["tack"]:
+            changes += 1
+    return changes
 
 
 def compute_tack_point(
@@ -479,34 +764,79 @@ def compute_leg_path(
 
 
 def compute_full_course(config: SimConfig) -> dict:
-    """Compute optimal path for a full upwind-downwind course."""
+    """Compute optimal path using grid-based Dijkstra with spatial wind."""
     start = np.array([config.start_x, config.start_y])
     mark = np.array([config.mark_x, config.mark_y])
     finish = np.array([config.finish_x, config.finish_y])
+    interp = get_interpolator(config.boat_type)
 
-    wind_from = config.wind_direction_deg
-    tws = config.wind_speed_kts
+    # Create spatial wind field
+    seed = make_wind_seed(config)
+    wind_field = WindField(config.wind_speed_kts, config.wind_direction_deg, seed=seed)
 
-    upwind = compute_leg_path(
-        start, mark, wind_from, tws, config.boat_type,
-        config.dt_seconds, t_offset=0.0, leg_name="upwind",
-    )
+    # Grid bounds covering entire course with padding
+    all_x = [config.start_x, config.mark_x, config.finish_x]
+    all_y = [config.start_y, config.mark_y, config.finish_y]
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    pad = max(x_max - x_min, y_max - y_min, 0.1) * 0.4
+    x_min -= pad; x_max += pad
+    y_min -= pad; y_max += pad
 
-    t_after_upwind = upwind.waypoints[-1].elapsed_seconds if upwind.waypoints else 0.0
+    grid_size = GRID_SIZE
+    xs = np.linspace(x_min, x_max, grid_size)
+    ys = np.linspace(y_min, y_max, grid_size)
 
-    downwind = compute_leg_path(
-        mark, finish, wind_from, tws, config.boat_type,
-        config.dt_seconds, t_offset=t_after_upwind, leg_name="downwind",
-    )
+    # Build tack-state-aware graph (nodes doubled for starboard/port state)
+    graph = build_course_graph(wind_field, interp, xs, ys, grid_size, config.boat_type)
 
-    all_waypoints = upwind.waypoints + downwind.waypoints
+    si = int(np.argmin(np.abs(xs - start[0])))
+    sj = int(np.argmin(np.abs(ys - start[1])))
+    mi = int(np.argmin(np.abs(xs - mark[0])))
+    mj = int(np.argmin(np.abs(ys - mark[1])))
+    fi = int(np.argmin(np.abs(xs - finish[0])))
+    fj = int(np.argmin(np.abs(ys - finish[1])))
+
+    start_id = si * grid_size + sj
+    mark_id = mi * grid_size + mj
+    finish_id = fi * grid_size + fj
+
+    # Upwind: start -> mark
+    upwind_path = find_optimal_grid_path(graph, start_id, mark_id, xs, ys, grid_size)
+
+    # Downwind: mark -> finish
+    downwind_path = find_optimal_grid_path(graph, mark_id, finish_id, xs, ys, grid_size)
+
+    # Convert to waypoints
+    up_wps = path_to_waypoints(upwind_path, wind_field, interp, mark, 0.0, "upwind")
+    t_after_up = up_wps[-1]["time"] if up_wps else 0.0
+    dn_wps = path_to_waypoints(downwind_path, wind_field, interp, finish, t_after_up, "downwind")
+
+    all_wps = up_wps + dn_wps
+
+    # Laylines from wind at mark
+    mark_ws, mark_wd = wind_field.at(float(mark[0]), float(mark[1]))
+    up_twa, _, up_vmg = find_optimal_vmg(mark_ws, interp)
+    dn_twa, _, dn_vmg = find_optimal_downwind_vmg(mark_ws, interp)
 
     return {
-        "waypoints": all_waypoints,
-        "upwind": upwind,
-        "downwind": downwind,
-        "total_distance_nm": upwind.total_distance_nm + downwind.total_distance_nm,
-        "total_time_seconds": (upwind.total_time_seconds + downwind.total_time_seconds),
+        "waypoints": all_wps,
+        "upwind_twa": up_twa,
+        "upwind_vmg": up_vmg,
+        "downwind_twa": dn_twa,
+        "downwind_vmg": dn_vmg,
+        "n_tacks": count_tack_changes(up_wps),
+        "n_jibes": count_tack_changes(dn_wps),
+        "total_distance_nm": sum_path_distance(upwind_path) + sum_path_distance(downwind_path),
+        "total_time_seconds": all_wps[-1]["time"] if all_wps else 0.0,
+        "laylines": {
+            "upwind_sb": (mark_wd + up_twa) % 360,
+            "upwind_port": (mark_wd - up_twa) % 360,
+            "downwind_sb": (mark_wd + dn_twa) % 360,
+            "downwind_port": (mark_wd - dn_twa) % 360,
+        },
+        "wind_grid": wind_field.get_grid(x_min, x_max, y_min, y_max, n=12),
+        "wind_field": wind_field,
     }
 
 
@@ -603,43 +933,90 @@ def compute_user_leg(
     )
 
 
-def compute_user_course(
-    config: SimConfig,
-    user_tack_x: float, user_tack_y: float,
-    user_jibe_x: float, user_jibe_y: float,
+def compute_user_leg_spatial(
+    start: np.ndarray, end: np.ndarray,
+    via_points: list[np.ndarray],
+    wind_field: WindField, interp: RegularGridInterpolator,
+    t_offset: float, leg_name: str, n_samples: int = 40,
 ) -> dict:
-    """Compute a user-defined course through their chosen tack/jibe points."""
+    """Compute a user-defined multi-segment leg using local wind at each sample."""
+    all_wps: list[dict] = []
+    total_dist = 0.0
+    t = t_offset
+
+    # Build segment list: start -> via1 -> via2 -> ... -> end
+    nodes = [start] + via_points + [end]
+    segments = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)]
+
+    for seg_start, seg_end in segments:
+        diff = seg_end - seg_start
+        dist = float(np.linalg.norm(diff))
+        if dist < 1e-10:
+            continue
+
+        heading = math.degrees(math.atan2(diff[0], diff[1])) % 360
+        direction = diff / dist
+
+        for i in range(n_samples + 1):
+            frac = i / n_samples
+            pos = seg_start + frac * dist * direction
+            x, y = float(pos[0]), float(pos[1])
+
+            ws, wd = wind_field.at(x, y)
+            twa = abs(((heading - wd) % 360 + 180) % 360 - 180)
+            ws_c = max(6.0, min(20.0, ws))
+            speed = max(float(interp((ws_c, min(twa, 180.0)))), 0.5)
+
+            cross = ((heading - wd) % 360 + 360) % 360
+            tack = "starboard" if 0 < cross < 180 else "port"
+            vmg = speed * math.cos(math.radians(twa))
+
+            all_wps.append({
+                "x": x, "y": y, "heading": heading, "tack": tack,
+                "speed": speed, "vmg": abs(vmg), "time": t, "leg": leg_name,
+            })
+
+            if i < n_samples:
+                seg_time = (dist / n_samples) / (speed * KNOTS_TO_NM_PER_SEC)
+                t += seg_time
+
+        total_dist += dist
+
+    total_time = (all_wps[-1]["time"] - t_offset) if all_wps else 0.0
+    return {"waypoints": all_wps, "distance": total_dist, "time": total_time}
+
+
+def compute_user_course_spatial(
+    config: SimConfig, wind_field: WindField,
+    upwind_points: list[list[float]],
+    downwind_points: list[list[float]],
+) -> dict:
+    """Compute user-defined course through their waypoints with spatial wind."""
     start = np.array([config.start_x, config.start_y])
     mark = np.array([config.mark_x, config.mark_y])
     finish = np.array([config.finish_x, config.finish_y])
-    user_tack = np.array([user_tack_x, user_tack_y])
-    user_jibe = np.array([user_jibe_x, user_jibe_y])
+    interp = get_interpolator(config.boat_type)
 
-    wind_from = config.wind_direction_deg
-    tws = config.wind_speed_kts
+    up_via = [np.array(p) for p in upwind_points]
+    dn_via = [np.array(p) for p in downwind_points]
 
-    upwind = compute_user_leg(
-        start, user_tack, mark,
-        wind_from, tws, config.boat_type,
-        config.dt_seconds, t_offset=0.0, leg_name="upwind",
-    )
+    u_up = compute_user_leg_spatial(
+        start, mark, up_via, wind_field, interp, 0.0, "upwind")
+    u_t = u_up["waypoints"][-1]["time"] if u_up["waypoints"] else 0.0
+    u_dn = compute_user_leg_spatial(
+        mark, finish, dn_via, wind_field, interp, u_t, "downwind")
 
-    t_after_upwind = upwind.waypoints[-1].elapsed_seconds if upwind.waypoints else 0.0
-
-    downwind = compute_user_leg(
-        mark, user_jibe, finish,
-        wind_from, tws, config.boat_type,
-        config.dt_seconds, t_offset=t_after_upwind, leg_name="downwind",
-    )
-
-    all_waypoints = upwind.waypoints + downwind.waypoints
-
+    u_all_wps = u_up["waypoints"] + u_dn["waypoints"]
+    n_tacks = sum(1 for i in range(1, len(u_up["waypoints"]))
+                  if u_up["waypoints"][i]["tack"] != u_up["waypoints"][i-1]["tack"])
+    n_jibes = sum(1 for i in range(1, len(u_dn["waypoints"]))
+                  if u_dn["waypoints"][i]["tack"] != u_dn["waypoints"][i-1]["tack"])
     return {
-        "waypoints": all_waypoints,
-        "upwind": upwind,
-        "downwind": downwind,
-        "total_distance_nm": upwind.total_distance_nm + downwind.total_distance_nm,
-        "total_time_seconds": (upwind.total_time_seconds + downwind.total_time_seconds),
+        "waypoints": u_all_wps,
+        "total_distance_nm": u_up["distance"] + u_dn["distance"],
+        "total_time_seconds": u_all_wps[-1]["time"] if u_all_wps else 0.0,
+        "n_tacks": n_tacks,
+        "n_jibes": n_jibes,
     }
 
 
@@ -718,7 +1095,7 @@ canvas{width:100%;height:100%;display:block}
 <div id="controls">
   <div class="ctrl">
     <label>Mode</label>
-    <select id="mode"><option value="simulate">Simulate</option><option value="challenge" selected>Challenge</option></select>
+    <select id="mode"><option value="challenge" selected>Challenge</option><option value="simulate">Simulate</option></select>
   </div>
   <div class="ctrl">
     <label>Boat</label>
@@ -787,7 +1164,9 @@ canvas{width:100%;height:100%;display:block}
   <button id="simulate-btn" class="action-btn">Race</button>
   <button id="reset-btn" class="action-btn" style="display:none">Reset</button>
   <button id="newcourse-btn" class="action-btn">New Course</button>
-  <div id="challenge-hint">Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.</div>
+  <button id="phase-btn" class="action-btn" style="background:#2a5544;display:none">Upwind ▲</button>
+  <button id="undo-btn" class="action-btn" style="background:#443322;display:none">Undo</button>
+  <div id="challenge-hint">Click to place <b>upwind (tack)</b> points.</div>
 </div>
 <div id="main">
   <canvas id="sim"></canvas>
@@ -834,12 +1213,13 @@ let simState = 'idle'; // 'idle' | 'running' | 'paused' | 'finished'
 
 // --- Challenge mode state ---
 let mode = 'challenge';
-let userTackPoint = null;   // {x, y} world coords
-let userJibePoint = null;   // {x, y} world coords
-let placingPoint = 'tack';  // 'tack' | 'jibe' | 'done'
+let userUpwindPoints = [];    // [{x, y}, ...] world coords
+let userDownwindPoints = [];  // [{x, y}, ...] world coords
+let placingPhase = 'upwind';  // 'upwind' | 'downwind'
 let userWaypoints = null;
 let userSummary = null;
 let laylineData = null;     // from server response
+let windGridData = null;    // spatial wind field for visualization
 
 // --- Animation state ---
 let simElapsed = 0;       // simulate mode
@@ -877,7 +1257,7 @@ for (const [id, valId, fmt] of [
 ]) {
   $(id).addEventListener('input', () => {
     $(valId).textContent = fmt($(id).value);
-    if (simState === 'idle') { userTackPoint = null; userJibePoint = null; placingPoint = 'tack'; drawCourse(); }
+    if (simState === 'idle') { userUpwindPoints = []; userDownwindPoints = []; placingPhase = 'upwind'; drawCourse(); }
   });
 }
 $('boat').addEventListener('change', () => {
@@ -891,8 +1271,12 @@ function randomizeCourse() {
   const startY = +(Math.random() * 0.4 - 0.2).toFixed(2);   // -0.2 to +0.2
   const markX = +(Math.random() * 0.4 - 0.2).toFixed(2);    // -0.2 to +0.2
   const markY = +(Math.random() * 0.6 + 0.7).toFixed(2);    // 0.7 to 1.3
-  const finishX = +(Math.random() * 0.6 - 0.3).toFixed(2);  // -0.3 to +0.3
-  const finishY = +(Math.random() * 0.4 - 0.2).toFixed(2);  // -0.2 to +0.2
+  // Ensure finish is not at the same position as start (minimum 0.1 separation)
+  let finishX, finishY;
+  do {
+    finishX = +(Math.random() * 0.6 - 0.3).toFixed(2);
+    finishY = +(Math.random() * 0.4 - 0.2).toFixed(2);
+  } while (Math.sqrt((finishX - startX)**2 + (finishY - startY)**2) < 0.1);
 
   $('windDir').value = windDir;
   $('windDirVal').textContent = String(((windDir % 360) + 360) % 360).padStart(3, '0') + '°';
@@ -934,10 +1318,13 @@ $('mode').addEventListener('change', () => {
     btn.textContent = 'Race';
     $('challenge-hint').style.display = '';
     $('newcourse-btn').style.display = '';
+    phaseBtn.style.display = '';
+    undoBtn.style.display = '';
     setSlidersVisible(false);
-    userTackPoint = null;
-    userJibePoint = null;
-    placingPoint = 'tack';
+    userUpwindPoints = [];
+    userDownwindPoints = [];
+    placingPhase = 'upwind';
+    updatePhaseBtn();
     randomizeCourse();
     setCourseControlsLocked(true);
     fetchLaylines();
@@ -945,9 +1332,11 @@ $('mode').addEventListener('change', () => {
     btn.textContent = 'Simulate';
     $('challenge-hint').style.display = 'none';
     $('newcourse-btn').style.display = 'none';
+    phaseBtn.style.display = 'none';
+    undoBtn.style.display = 'none';
     setSlidersVisible(true);
-    userTackPoint = null;
-    userJibePoint = null;
+    userUpwindPoints = [];
+    userDownwindPoints = [];
     setCourseControlsLocked(false);
   }
   if (simState !== 'idle') goIdle();
@@ -1018,13 +1407,13 @@ function c2w(cx, cy, b) {
   ];
 }
 
-// --- Canvas click handler (Challenge mode point placement) ---
+// --- Canvas click handler (Challenge mode multi-waypoint placement) ---
 canvas.addEventListener('click', (e) => {
   if (mode !== 'challenge' || simState !== 'idle') return;
   const p = getParams();
   const allPts = [[p.startX, p.startY], [p.markX, p.markY], [p.finishX, p.finishY]];
-  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
-  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
+  for (const pt of userUpwindPoints) allPts.push([pt.x, pt.y]);
+  for (const pt of userDownwindPoints) allPts.push([pt.x, pt.y]);
   const b = makeBounds(allPts);
 
   const rect = canvas.getBoundingClientRect();
@@ -1032,22 +1421,67 @@ canvas.addEventListener('click', (e) => {
   const cy = (e.clientY - rect.top) * devicePixelRatio;
   const [wx, wy] = c2w(cx, cy, b);
 
-  if (placingPoint === 'tack') {
-    userTackPoint = {x: wx, y: wy};
-    placingPoint = 'jibe';
-    $('challenge-hint').innerHTML = 'Tack point set. Now click to place your <b>jibe point</b>.';
-  } else if (placingPoint === 'jibe') {
-    userJibePoint = {x: wx, y: wy};
-    placingPoint = 'done';
-    $('challenge-hint').innerHTML = 'Both points set. Hit <b>Race</b>! (Click canvas to re-place.)';
+  if (placingPhase === 'upwind') {
+    userUpwindPoints.push({x: wx, y: wy});
+    updateHint();
   } else {
-    userTackPoint = {x: wx, y: wy};
-    userJibePoint = null;
-    placingPoint = 'jibe';
-    $('challenge-hint').innerHTML = 'Tack point re-placed. Now click to place your <b>jibe point</b>.';
+    userDownwindPoints.push({x: wx, y: wy});
+    updateHint();
   }
   drawCourse();
 });
+
+// --- Phase toggle button ---
+const phaseBtn = $('phase-btn');
+const undoBtn = $('undo-btn');
+
+phaseBtn.addEventListener('click', () => {
+  if (mode !== 'challenge' || simState !== 'idle') return;
+  placingPhase = placingPhase === 'upwind' ? 'downwind' : 'upwind';
+  updatePhaseBtn();
+  updateHint();
+  drawCourse();
+});
+
+undoBtn.addEventListener('click', () => {
+  if (mode !== 'challenge' || simState !== 'idle') return;
+  if (placingPhase === 'upwind' && userUpwindPoints.length > 0) {
+    userUpwindPoints.pop();
+  } else if (placingPhase === 'downwind' && userDownwindPoints.length > 0) {
+    userDownwindPoints.pop();
+  }
+  updateHint();
+  drawCourse();
+});
+
+// Backspace still works as keyboard shortcut for undo
+document.addEventListener('keydown', (e) => {
+  if (mode !== 'challenge' || simState !== 'idle') return;
+  if (e.key === 'Backspace') {
+    e.preventDefault();
+    undoBtn.click();
+  }
+});
+
+function updatePhaseBtn() {
+  if (placingPhase === 'upwind') {
+    phaseBtn.textContent = 'Upwind ▲';
+    phaseBtn.style.background = '#2a5544';
+  } else {
+    phaseBtn.textContent = 'Downwind ▼';
+    phaseBtn.style.background = '#554422';
+  }
+}
+
+function updateHint() {
+  const nUp = userUpwindPoints.length;
+  const nDn = userDownwindPoints.length;
+  const phase = placingPhase === 'upwind' ? 'upwind (tack)' : 'downwind (jibe)';
+  let msg = 'Placing <b>' + phase + '</b> points. ';
+  msg += nUp + ' upwind, ' + nDn + ' downwind.';
+  if (nUp > 0 || nDn > 0) msg += ' <b>Race</b> when ready.';
+  $('challenge-hint').innerHTML = msg;
+}
 
 // --- Draw wind arrow ---
 function drawWindArrow(dir, speed, bounds) {
@@ -1084,6 +1518,43 @@ function drawWindArrow(dir, speed, bounds) {
   ctx.font = (11*dpr)+'px monospace';
   ctx.textAlign = 'center';
   ctx.fillText(speed+' kts', cx, cy + arrowLen*0.95);
+}
+
+// --- Draw spatial wind field arrows ---
+function drawWindField(wg, b) {
+  if (!wg) return;
+  const dpr = devicePixelRatio;
+  const {x_min, x_max, y_min, y_max, nx, ny, speeds, directions} = wg;
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      const wx = x_min + (x_max - x_min) * i / (nx - 1);
+      const wy = y_min + (y_max - y_min) * j / (ny - 1);
+      const [cx, cy] = w2c(wx, wy, b);
+      const spd = speeds[i][j];
+      const dir = directions[i][j];
+      const len = 18 * dpr * (spd / 15);
+      const rad = dir * Math.PI / 180;
+      // Downwind direction in canvas coords: (-sin(rad), +cos(rad))
+      const dx = -Math.sin(rad) * len * 0.5;
+      const dy = Math.cos(rad) * len * 0.5;
+      const alpha = 0.45 + 0.25 * (spd / 20);
+      ctx.strokeStyle = 'rgba(130,185,240,' + alpha + ')';
+      ctx.lineWidth = 1.8 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(cx - dx, cy - dy);
+      ctx.lineTo(cx + dx, cy + dy);
+      ctx.stroke();
+      // Arrowhead at downwind end
+      const angle = Math.atan2(dy, dx);
+      const hs = 6 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(cx + dx, cy + dy);
+      ctx.lineTo(cx + dx - hs*Math.cos(angle-0.5), cy + dy - hs*Math.sin(angle-0.5));
+      ctx.moveTo(cx + dx, cy + dy);
+      ctx.lineTo(cx + dx - hs*Math.cos(angle+0.5), cy + dy - hs*Math.sin(angle+0.5));
+      ctx.stroke();
+    }
+  }
 }
 
 // --- Draw grid ---
@@ -1170,11 +1641,12 @@ function drawLaylines(b, p) {
   }
 }
 
-// --- Draw user-placed tack/jibe points ---
+// --- Draw user-placed waypoints ---
 function drawUserPoints(b) {
   const dpr = devicePixelRatio;
-  if (userTackPoint) {
-    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
+  for (let i = 0; i < userUpwindPoints.length; i++) {
+    const pt = userUpwindPoints[i];
+    const [tx,ty] = w2c(pt.x, pt.y, b);
     ctx.strokeStyle = '#44ddff';
     ctx.lineWidth = 2*dpr;
     const s = 8*dpr;
@@ -1183,10 +1655,11 @@ function drawUserPoints(b) {
     ctx.fillStyle = '#44ddff';
     ctx.font = (10*dpr)+'px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('YOUR TACK', tx, ty - 12*dpr);
+    ctx.fillText('T' + (i+1), tx, ty - 12*dpr);
   }
-  if (userJibePoint) {
-    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
+  for (let i = 0; i < userDownwindPoints.length; i++) {
+    const pt = userDownwindPoints[i];
+    const [jx,jy] = w2c(pt.x, pt.y, b);
     ctx.strokeStyle = '#ffaa44';
     ctx.lineWidth = 2*dpr;
     const s = 8*dpr;
@@ -1195,7 +1668,7 @@ function drawUserPoints(b) {
     ctx.fillStyle = '#ffaa44';
     ctx.font = (10*dpr)+'px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('YOUR JIBE', jx, jy - 12*dpr);
+    ctx.fillText('J' + (i+1), jx, jy - 12*dpr);
   }
 }
 
@@ -1206,24 +1679,32 @@ function drawUserProposedPath(b) {
   ctx.setLineDash([4*dpr, 4*dpr]);
   ctx.lineWidth = 1.5*dpr;
 
-  if (userTackPoint) {
-    // start -> tack -> mark
+  if (userUpwindPoints.length > 0) {
+    // start -> tack1 -> tack2 -> ... -> mark
     ctx.strokeStyle = 'rgba(68,221,255,0.35)';
     ctx.beginPath();
     const [sx,sy] = w2c(p.startX, p.startY, b);
-    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
+    ctx.moveTo(sx,sy);
+    for (const pt of userUpwindPoints) {
+      const [tx,ty] = w2c(pt.x, pt.y, b);
+      ctx.lineTo(tx,ty);
+    }
     const [mx,my] = w2c(p.markX, p.markY, b);
-    ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.lineTo(mx,my);
+    ctx.lineTo(mx,my);
     ctx.stroke();
   }
-  if (userJibePoint) {
-    // mark -> jibe -> finish
+  if (userDownwindPoints.length > 0) {
+    // mark -> jibe1 -> jibe2 -> ... -> finish
     ctx.strokeStyle = 'rgba(255,170,68,0.35)';
     ctx.beginPath();
     const [mx,my] = w2c(p.markX, p.markY, b);
-    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
+    ctx.moveTo(mx,my);
+    for (const pt of userDownwindPoints) {
+      const [jx,jy] = w2c(pt.x, pt.y, b);
+      ctx.lineTo(jx,jy);
+    }
     const [fx,fy] = w2c(p.finishX, p.finishY, b);
-    ctx.moveTo(mx,my); ctx.lineTo(jx,jy); ctx.lineTo(fx,fy);
+    ctx.lineTo(fx,fy);
     ctx.stroke();
   }
   ctx.setLineDash([]);
@@ -1239,17 +1720,18 @@ function drawCourse() {
   ctx.fillRect(0, 0, cw, ch);
 
   const allPts = [[p.startX, p.startY], [p.markX, p.markY], [p.finishX, p.finishY]];
-  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
-  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
+  for (const pt of userUpwindPoints) allPts.push([pt.x, pt.y]);
+  for (const pt of userDownwindPoints) allPts.push([pt.x, pt.y]);
   const b = makeBounds(allPts);
   drawGrid(b);
+  drawWindField(windGridData, b);
   if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
   if (mode === 'challenge') {
     drawUserProposedPath(b);
     drawUserPoints(b);
   }
   drawMarks(p, b);
-  drawWindArrow(p.windDir, p.windSpeed, b);
+  // Wind compass removed — spatial wind field arrows show local wind
 }
 
 // --- Interpolate waypoint at a given elapsed time ---
@@ -1340,6 +1822,7 @@ function drawFrame() {
   cachedBounds = b;
 
   drawGrid(b);
+  drawWindField(windGridData, b);
   if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
 
   const isChallenge = mode === 'challenge' && userWaypoints;
@@ -1396,7 +1879,7 @@ function drawFrame() {
   }
 
   drawMarks(p, b);
-  drawWindArrow(p.windDir, p.windSpeed, b);
+  // Wind compass removed — spatial wind field arrows show local wind
 
   // Interpolate current positions (challenge uses independent clocks)
   const optT = isChallenge ? optElapsed : simElapsed;
@@ -1465,10 +1948,10 @@ btn.addEventListener('click', handleBtn);
 resetBtn.addEventListener('click', goIdle);
 newCourseBtn.addEventListener('click', () => {
   if (simState !== 'idle') goIdle();
-  userTackPoint = null;
-  userJibePoint = null;
-  placingPoint = 'tack';
-  $('challenge-hint').innerHTML = 'Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.';
+  userUpwindPoints = [];
+  userDownwindPoints = [];
+  placingPhase = 'upwind';
+  updateHint();
   randomizeCourse();
   fetchLaylines();
   drawCourse();
@@ -1492,18 +1975,23 @@ function goIdle() {
   $('score-panel').style.display = 'none';
   $('summary').style.display = 'none';
   if (mode === 'challenge') {
-    userTackPoint = null;
-    userJibePoint = null;
-    placingPoint = 'tack';
-    $('challenge-hint').innerHTML = 'Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.';
+    userUpwindPoints = [];
+    userDownwindPoints = [];
+    placingPhase = 'upwind';
+    updatePhaseBtn();
+    updateHint();
     $('challenge-hint').style.display = '';
     $('newcourse-btn').style.display = '';
+    phaseBtn.style.display = '';
+    undoBtn.style.display = '';
     setSlidersVisible(false);
     randomizeCourse();
     setCourseControlsLocked(true);
     fetchLaylines();
   } else {
     $('newcourse-btn').style.display = 'none';
+    phaseBtn.style.display = 'none';
+    undoBtn.style.display = 'none';
     setSlidersVisible(true);
   }
   drawCourse();
@@ -1511,8 +1999,8 @@ function goIdle() {
 
 function handleBtn() {
   if (simState === 'idle') {
-    if (mode === 'challenge' && (!userTackPoint || !userJibePoint)) {
-      $('challenge-hint').innerHTML = '<span style="color:#ff6666">Place both tack and jibe points first!</span>';
+    if (mode === 'challenge' && userUpwindPoints.length === 0 && userDownwindPoints.length === 0) {
+      $('challenge-hint').innerHTML = '<span style="color:#ff6666">Place at least one waypoint first!</span>';
       return;
     }
     fetchAndRun();
@@ -1555,11 +2043,9 @@ async function fetchAndRun() {
     finish_y: p.finishY,
   };
 
-  if (mode === 'challenge' && userTackPoint && userJibePoint) {
-    body.user_tack_x = userTackPoint.x;
-    body.user_tack_y = userTackPoint.y;
-    body.user_jibe_x = userJibePoint.x;
-    body.user_jibe_y = userJibePoint.y;
+  if (mode === 'challenge' && (userUpwindPoints.length > 0 || userDownwindPoints.length > 0)) {
+    body.user_upwind_points = userUpwindPoints.map(p => [p.x, p.y]);
+    body.user_downwind_points = userDownwindPoints.map(p => [p.x, p.y]);
   }
 
   try {
@@ -1572,6 +2058,7 @@ async function fetchAndRun() {
     waypoints = data.waypoints;
     summary = data.summary;
     laylineData = summary.laylines || null;
+    windGridData = data.wind_grid || null;
 
     if (data.user_waypoints) {
       userWaypoints = data.user_waypoints;
@@ -1721,6 +2208,7 @@ function fetchLaylines() {
       });
       const data = await resp.json();
       laylineData = data.summary.laylines || null;
+      windGridData = data.wind_grid || null;
       if (simState === 'idle') drawCourse();
     } catch(e) {}
   }, 200);
@@ -1737,6 +2225,9 @@ randomizeCourse();
 setCourseControlsLocked(true);
 setSlidersVisible(false);
 $('newcourse-btn').style.display = '';
+phaseBtn.style.display = '';
+undoBtn.style.display = '';
+updatePhaseBtn();
 
 // Initial fetch
 fetchLaylines();
@@ -1780,63 +2271,40 @@ class SimHandler(http.server.BaseHTTPRequestHandler):
                 finish_y=body.get("finish_y", 0.0),
             )
             course = compute_full_course(config)
-            up = course["upwind"]
-            down = course["downwind"]
-
-            # Compute layline headings from optimal TWA + wind
-            wind_dir = config.wind_direction_deg
-            up_twa = up.optimal_twa_deg
-            dn_twa = down.optimal_twa_deg
-            laylines = {
-                "upwind_sb": (wind_dir + up_twa) % 360,
-                "upwind_port": (wind_dir - up_twa) % 360,
-                "downwind_sb": (wind_dir + dn_twa) % 360,
-                "downwind_port": (wind_dir - dn_twa) % 360,
-            }
-
-            def serialize_waypoints(wps):
-                return [
-                    {"x": wp.x, "y": wp.y, "heading": wp.heading_deg,
-                     "tack": wp.tack, "speed": wp.speed_kts,
-                     "vmg": wp.vmg_kts, "time": wp.elapsed_seconds,
-                     "leg": wp.leg}
-                    for wp in wps
-                ]
+            wind_field = course["wind_field"]
 
             result = {
-                "waypoints": serialize_waypoints(course["waypoints"]),
+                "waypoints": course["waypoints"],
                 "summary": {
                     "total_distance_nm": course["total_distance_nm"],
                     "total_time_s": course["total_time_seconds"],
-                    "upwind_twa": up.optimal_twa_deg,
-                    "upwind_vmg": up.optimal_vmg_kts,
-                    "upwind_speed": up.optimal_speed_kts,
-                    "n_tacks": up.n_tacks,
-                    "downwind_twa": down.optimal_twa_deg,
-                    "downwind_vmg": down.optimal_vmg_kts,
-                    "downwind_speed": down.optimal_speed_kts,
-                    "n_jibes": down.n_tacks,
-                    "laylines": laylines,
+                    "upwind_twa": course["upwind_twa"],
+                    "upwind_vmg": course["upwind_vmg"],
+                    "n_tacks": course["n_tacks"],
+                    "downwind_twa": course["downwind_twa"],
+                    "downwind_vmg": course["downwind_vmg"],
+                    "n_jibes": course["n_jibes"],
+                    "laylines": course["laylines"],
                 },
+                "wind_grid": course["wind_grid"],
             }
 
-            # If user tack/jibe points provided, compute user path too
-            if "user_tack_x" in body and "user_jibe_x" in body:
-                user_course = compute_user_course(
-                    config,
-                    body["user_tack_x"], body["user_tack_y"],
-                    body["user_jibe_x"], body["user_jibe_y"],
+            # If user waypoints provided, compute user path
+            if "user_upwind_points" in body or "user_downwind_points" in body:
+                upwind_pts = body.get("user_upwind_points", [])
+                downwind_pts = body.get("user_downwind_points", [])
+                user_course = compute_user_course_spatial(
+                    config, wind_field, upwind_pts, downwind_pts,
                 )
-                u_up = user_course["upwind"]
-                u_dn = user_course["downwind"]
-                result["user_waypoints"] = serialize_waypoints(user_course["waypoints"])
+                result["user_waypoints"] = user_course["waypoints"]
                 result["user_summary"] = {
                     "total_distance_nm": user_course["total_distance_nm"],
                     "total_time_s": user_course["total_time_seconds"],
-                    "n_tacks": u_up.n_tacks,
-                    "n_jibes": u_dn.n_tacks,
+                    "n_tacks": user_course["n_tacks"],
+                    "n_jibes": user_course["n_jibes"],
                 }
 
+            # Remove non-serializable wind_field before JSON encoding
             payload = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

@@ -60,7 +60,7 @@ canvas{width:100%;height:100%;display:block}
 <div id="controls">
   <div class="ctrl">
     <label>Mode</label>
-    <select id="mode"><option value="challenge" selected>Challenge</option><option value="simulate">Simulate</option></select>
+    <select id="mode"><option value="simulate">Simulate</option><option value="challenge" selected>Challenge</option></select>
   </div>
   <div class="ctrl">
     <label>Boat</label>
@@ -129,9 +129,7 @@ canvas{width:100%;height:100%;display:block}
   <button id="simulate-btn" class="action-btn">Race</button>
   <button id="reset-btn" class="action-btn" style="display:none">Reset</button>
   <button id="newcourse-btn" class="action-btn">New Course</button>
-  <button id="phase-btn" class="action-btn" style="background:#2a5544;display:none">Upwind ▲</button>
-  <button id="undo-btn" class="action-btn" style="background:#443322;display:none">Undo</button>
-  <div id="challenge-hint">Click to place <b>upwind (tack)</b> points.</div>
+  <div id="challenge-hint">Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.</div>
 </div>
 <div id="main">
   <canvas id="sim"></canvas>
@@ -178,13 +176,12 @@ let simState = 'idle'; // 'idle' | 'running' | 'paused' | 'finished'
 
 // --- Challenge mode state ---
 let mode = 'challenge';
-let userUpwindPoints = [];    // [{x, y}, ...] world coords
-let userDownwindPoints = [];  // [{x, y}, ...] world coords
-let placingPhase = 'upwind';  // 'upwind' | 'downwind'
+let userTackPoint = null;   // {x, y} world coords
+let userJibePoint = null;   // {x, y} world coords
+let placingPoint = 'tack';  // 'tack' | 'jibe' | 'done'
 let userWaypoints = null;
 let userSummary = null;
 let laylineData = null;     // from server response
-let windGridData = null;    // spatial wind field for visualization
 
 // --- Animation state ---
 let simElapsed = 0;       // simulate mode
@@ -222,7 +219,7 @@ for (const [id, valId, fmt] of [
 ]) {
   $(id).addEventListener('input', () => {
     $(valId).textContent = fmt($(id).value);
-    if (simState === 'idle') { userUpwindPoints = []; userDownwindPoints = []; placingPhase = 'upwind'; drawCourse(); }
+    if (simState === 'idle') { userTackPoint = null; userJibePoint = null; placingPoint = 'tack'; drawCourse(); }
   });
 }
 $('boat').addEventListener('change', () => {
@@ -236,12 +233,8 @@ function randomizeCourse() {
   const startY = +(Math.random() * 0.4 - 0.2).toFixed(2);   // -0.2 to +0.2
   const markX = +(Math.random() * 0.4 - 0.2).toFixed(2);    // -0.2 to +0.2
   const markY = +(Math.random() * 0.6 + 0.7).toFixed(2);    // 0.7 to 1.3
-  // Ensure finish is not at the same position as start (minimum 0.1 separation)
-  let finishX, finishY;
-  do {
-    finishX = +(Math.random() * 0.6 - 0.3).toFixed(2);
-    finishY = +(Math.random() * 0.4 - 0.2).toFixed(2);
-  } while (Math.sqrt((finishX - startX)**2 + (finishY - startY)**2) < 0.1);
+  const finishX = +(Math.random() * 0.6 - 0.3).toFixed(2);  // -0.3 to +0.3
+  const finishY = +(Math.random() * 0.4 - 0.2).toFixed(2);  // -0.2 to +0.2
 
   $('windDir').value = windDir;
   $('windDirVal').textContent = String(((windDir % 360) + 360) % 360).padStart(3, '0') + '°';
@@ -283,13 +276,10 @@ $('mode').addEventListener('change', () => {
     btn.textContent = 'Race';
     $('challenge-hint').style.display = '';
     $('newcourse-btn').style.display = '';
-    phaseBtn.style.display = '';
-    undoBtn.style.display = '';
     setSlidersVisible(false);
-    userUpwindPoints = [];
-    userDownwindPoints = [];
-    placingPhase = 'upwind';
-    updatePhaseBtn();
+    userTackPoint = null;
+    userJibePoint = null;
+    placingPoint = 'tack';
     randomizeCourse();
     setCourseControlsLocked(true);
     fetchLaylines();
@@ -297,11 +287,9 @@ $('mode').addEventListener('change', () => {
     btn.textContent = 'Simulate';
     $('challenge-hint').style.display = 'none';
     $('newcourse-btn').style.display = 'none';
-    phaseBtn.style.display = 'none';
-    undoBtn.style.display = 'none';
     setSlidersVisible(true);
-    userUpwindPoints = [];
-    userDownwindPoints = [];
+    userTackPoint = null;
+    userJibePoint = null;
     setCourseControlsLocked(false);
   }
   if (simState !== 'idle') goIdle();
@@ -377,73 +365,31 @@ canvas.addEventListener('click', (e) => {
   if (mode !== 'challenge' || simState !== 'idle') return;
   const p = getParams();
   const allPts = [[p.startX, p.startY], [p.markX, p.markY], [p.finishX, p.finishY]];
-  for (const pt of userUpwindPoints) allPts.push([pt.x, pt.y]);
-  for (const pt of userDownwindPoints) allPts.push([pt.x, pt.y]);
+  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
+  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
   const b = makeBounds(allPts);
+
   const rect = canvas.getBoundingClientRect();
   const cx = (e.clientX - rect.left) * devicePixelRatio;
   const cy = (e.clientY - rect.top) * devicePixelRatio;
   const [wx, wy] = c2w(cx, cy, b);
-  if (placingPhase === 'upwind') {
-    userUpwindPoints.push({x: wx, y: wy});
+
+  if (placingPoint === 'tack') {
+    userTackPoint = {x: wx, y: wy};
+    placingPoint = 'jibe';
+    $('challenge-hint').innerHTML = 'Tack point set. Now click to place your <b>jibe point</b>.';
+  } else if (placingPoint === 'jibe') {
+    userJibePoint = {x: wx, y: wy};
+    placingPoint = 'done';
+    $('challenge-hint').innerHTML = 'Both points set. Hit <b>Race</b>! (Click canvas to re-place.)';
   } else {
-    userDownwindPoints.push({x: wx, y: wy});
+    userTackPoint = {x: wx, y: wy};
+    userJibePoint = null;
+    placingPoint = 'jibe';
+    $('challenge-hint').innerHTML = 'Tack point re-placed. Now click to place your <b>jibe point</b>.';
   }
-  updateHint();
   drawCourse();
 });
-
-// --- Phase toggle button ---
-const phaseBtn = $('phase-btn');
-const undoBtn = $('undo-btn');
-
-phaseBtn.addEventListener('click', () => {
-  if (mode !== 'challenge' || simState !== 'idle') return;
-  placingPhase = placingPhase === 'upwind' ? 'downwind' : 'upwind';
-  updatePhaseBtn();
-  updateHint();
-  drawCourse();
-});
-
-undoBtn.addEventListener('click', () => {
-  if (mode !== 'challenge' || simState !== 'idle') return;
-  if (placingPhase === 'upwind' && userUpwindPoints.length > 0) {
-    userUpwindPoints.pop();
-  } else if (placingPhase === 'downwind' && userDownwindPoints.length > 0) {
-    userDownwindPoints.pop();
-  }
-  updateHint();
-  drawCourse();
-});
-
-// Backspace still works as keyboard shortcut for undo
-document.addEventListener('keydown', (e) => {
-  if (mode !== 'challenge' || simState !== 'idle') return;
-  if (e.key === 'Backspace') {
-    e.preventDefault();
-    undoBtn.click();
-  }
-});
-
-function updatePhaseBtn() {
-  if (placingPhase === 'upwind') {
-    phaseBtn.textContent = 'Upwind ▲';
-    phaseBtn.style.background = '#2a5544';
-  } else {
-    phaseBtn.textContent = 'Downwind ▼';
-    phaseBtn.style.background = '#554422';
-  }
-}
-
-function updateHint() {
-  const nUp = userUpwindPoints.length;
-  const nDn = userDownwindPoints.length;
-  const phase = placingPhase === 'upwind' ? 'upwind (tack)' : 'downwind (jibe)';
-  let msg = 'Placing <b>' + phase + '</b> points. ';
-  msg += nUp + ' upwind, ' + nDn + ' downwind.';
-  if (nUp > 0 || nDn > 0) msg += ' <b>Race</b> when ready.';
-  $('challenge-hint').innerHTML = msg;
-}
 
 // --- Draw wind arrow ---
 function drawWindArrow(dir, speed, bounds) {
@@ -480,43 +426,6 @@ function drawWindArrow(dir, speed, bounds) {
   ctx.font = (11*dpr)+'px monospace';
   ctx.textAlign = 'center';
   ctx.fillText(speed+' kts', cx, cy + arrowLen*0.95);
-}
-
-// --- Draw spatial wind field arrows ---
-function drawWindField(wg, b) {
-  if (!wg) return;
-  const dpr = devicePixelRatio;
-  const {x_min, x_max, y_min, y_max, nx, ny, speeds, directions} = wg;
-  for (let i = 0; i < nx; i++) {
-    for (let j = 0; j < ny; j++) {
-      const wx = x_min + (x_max - x_min) * i / (nx - 1);
-      const wy = y_min + (y_max - y_min) * j / (ny - 1);
-      const [cx, cy] = w2c(wx, wy, b);
-      const spd = speeds[i][j];
-      const dir = directions[i][j];
-      const len = 18 * dpr * (spd / 15);
-      const rad = dir * Math.PI / 180;
-      // Downwind direction in canvas coords: (-sin(rad), +cos(rad))
-      const dx = -Math.sin(rad) * len * 0.5;
-      const dy = Math.cos(rad) * len * 0.5;
-      const alpha = 0.45 + 0.25 * (spd / 20);
-      ctx.strokeStyle = 'rgba(130,185,240,' + alpha + ')';
-      ctx.lineWidth = 1.8 * dpr;
-      ctx.beginPath();
-      ctx.moveTo(cx - dx, cy - dy);
-      ctx.lineTo(cx + dx, cy + dy);
-      ctx.stroke();
-      // Arrowhead at downwind end
-      const angle = Math.atan2(dy, dx);
-      const hs = 6 * dpr;
-      ctx.beginPath();
-      ctx.moveTo(cx + dx, cy + dy);
-      ctx.lineTo(cx + dx - hs*Math.cos(angle-0.5), cy + dy - hs*Math.sin(angle-0.5));
-      ctx.moveTo(cx + dx, cy + dy);
-      ctx.lineTo(cx + dx - hs*Math.cos(angle+0.5), cy + dy - hs*Math.sin(angle+0.5));
-      ctx.stroke();
-    }
-  }
 }
 
 // --- Draw grid ---
@@ -606,9 +515,8 @@ function drawLaylines(b, p) {
 // --- Draw user-placed tack/jibe points ---
 function drawUserPoints(b) {
   const dpr = devicePixelRatio;
-  for (let i = 0; i < userUpwindPoints.length; i++) {
-    const pt = userUpwindPoints[i];
-    const [tx,ty] = w2c(pt.x, pt.y, b);
+  if (userTackPoint) {
+    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
     ctx.strokeStyle = '#44ddff';
     ctx.lineWidth = 2*dpr;
     const s = 8*dpr;
@@ -617,11 +525,10 @@ function drawUserPoints(b) {
     ctx.fillStyle = '#44ddff';
     ctx.font = (10*dpr)+'px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('T' + (i+1), tx, ty - 12*dpr);
+    ctx.fillText('YOUR TACK', tx, ty - 12*dpr);
   }
-  for (let i = 0; i < userDownwindPoints.length; i++) {
-    const pt = userDownwindPoints[i];
-    const [jx,jy] = w2c(pt.x, pt.y, b);
+  if (userJibePoint) {
+    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
     ctx.strokeStyle = '#ffaa44';
     ctx.lineWidth = 2*dpr;
     const s = 8*dpr;
@@ -630,7 +537,7 @@ function drawUserPoints(b) {
     ctx.fillStyle = '#ffaa44';
     ctx.font = (10*dpr)+'px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('J' + (i+1), jx, jy - 12*dpr);
+    ctx.fillText('YOUR JIBE', jx, jy - 12*dpr);
   }
 }
 
@@ -640,30 +547,25 @@ function drawUserProposedPath(b) {
   const p = getParams();
   ctx.setLineDash([4*dpr, 4*dpr]);
   ctx.lineWidth = 1.5*dpr;
-  if (userUpwindPoints.length > 0) {
+
+  if (userTackPoint) {
+    // start -> tack -> mark
     ctx.strokeStyle = 'rgba(68,221,255,0.35)';
     ctx.beginPath();
     const [sx,sy] = w2c(p.startX, p.startY, b);
-    ctx.moveTo(sx,sy);
-    for (const pt of userUpwindPoints) {
-      const [tx,ty] = w2c(pt.x, pt.y, b);
-      ctx.lineTo(tx,ty);
-    }
+    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
     const [mx,my] = w2c(p.markX, p.markY, b);
-    ctx.lineTo(mx,my);
+    ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.lineTo(mx,my);
     ctx.stroke();
   }
-  if (userDownwindPoints.length > 0) {
+  if (userJibePoint) {
+    // mark -> jibe -> finish
     ctx.strokeStyle = 'rgba(255,170,68,0.35)';
     ctx.beginPath();
     const [mx,my] = w2c(p.markX, p.markY, b);
-    ctx.moveTo(mx,my);
-    for (const pt of userDownwindPoints) {
-      const [jx,jy] = w2c(pt.x, pt.y, b);
-      ctx.lineTo(jx,jy);
-    }
+    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
     const [fx,fy] = w2c(p.finishX, p.finishY, b);
-    ctx.lineTo(fx,fy);
+    ctx.moveTo(mx,my); ctx.lineTo(jx,jy); ctx.lineTo(fx,fy);
     ctx.stroke();
   }
   ctx.setLineDash([]);
@@ -679,18 +581,17 @@ function drawCourse() {
   ctx.fillRect(0, 0, cw, ch);
 
   const allPts = [[p.startX, p.startY], [p.markX, p.markY], [p.finishX, p.finishY]];
-  for (const pt of userUpwindPoints) allPts.push([pt.x, pt.y]);
-  for (const pt of userDownwindPoints) allPts.push([pt.x, pt.y]);
+  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
+  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
   const b = makeBounds(allPts);
   drawGrid(b);
-  drawWindField(windGridData, b);
   if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
   if (mode === 'challenge') {
     drawUserProposedPath(b);
     drawUserPoints(b);
   }
   drawMarks(p, b);
-  // Wind compass removed — spatial wind field arrows show local wind
+  drawWindArrow(p.windDir, p.windSpeed, b);
 }
 
 // --- Interpolate waypoint at a given elapsed time ---
@@ -781,7 +682,6 @@ function drawFrame() {
   cachedBounds = b;
 
   drawGrid(b);
-  drawWindField(windGridData, b);
   if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
 
   const isChallenge = mode === 'challenge' && userWaypoints;
@@ -838,7 +738,7 @@ function drawFrame() {
   }
 
   drawMarks(p, b);
-  // Wind compass removed — spatial wind field arrows show local wind
+  drawWindArrow(p.windDir, p.windSpeed, b);
 
   // Interpolate current positions (challenge uses independent clocks)
   const optT = isChallenge ? optElapsed : simElapsed;
@@ -907,11 +807,10 @@ btn.addEventListener('click', handleBtn);
 resetBtn.addEventListener('click', goIdle);
 newCourseBtn.addEventListener('click', () => {
   if (simState !== 'idle') goIdle();
-  userUpwindPoints = [];
-  userDownwindPoints = [];
-  placingPhase = 'upwind';
-  updatePhaseBtn();
-  updateHint();
+  userTackPoint = null;
+  userJibePoint = null;
+  placingPoint = 'tack';
+  $('challenge-hint').innerHTML = 'Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.';
   randomizeCourse();
   fetchLaylines();
   drawCourse();
@@ -935,23 +834,18 @@ function goIdle() {
   $('score-panel').style.display = 'none';
   $('summary').style.display = 'none';
   if (mode === 'challenge') {
-    userUpwindPoints = [];
-    userDownwindPoints = [];
-    placingPhase = 'upwind';
-    updatePhaseBtn();
-    updateHint();
+    userTackPoint = null;
+    userJibePoint = null;
+    placingPoint = 'tack';
+    $('challenge-hint').innerHTML = 'Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.';
     $('challenge-hint').style.display = '';
     $('newcourse-btn').style.display = '';
-    phaseBtn.style.display = '';
-    undoBtn.style.display = '';
     setSlidersVisible(false);
     randomizeCourse();
     setCourseControlsLocked(true);
     fetchLaylines();
   } else {
     $('newcourse-btn').style.display = 'none';
-    phaseBtn.style.display = 'none';
-    undoBtn.style.display = 'none';
     setSlidersVisible(true);
   }
   drawCourse();
@@ -959,8 +853,8 @@ function goIdle() {
 
 function handleBtn() {
   if (simState === 'idle') {
-    if (mode === 'challenge' && (userUpwindPoints.length === 0 && userDownwindPoints.length === 0)) {
-      $('challenge-hint').innerHTML = '<span style="color:#ff6666">Place at least one waypoint first!</span>';
+    if (mode === 'challenge' && (!userTackPoint || !userJibePoint)) {
+      $('challenge-hint').innerHTML = '<span style="color:#ff6666">Place both tack and jibe points first!</span>';
       return;
     }
     fetchAndRun();
@@ -1003,9 +897,11 @@ async function fetchAndRun() {
     finish_y: p.finishY,
   };
 
-  if (mode === 'challenge' && (userUpwindPoints.length > 0 || userDownwindPoints.length > 0)) {
-    body.user_upwind_points = userUpwindPoints.map(p => [p.x, p.y]);
-    body.user_downwind_points = userDownwindPoints.map(p => [p.x, p.y]);
+  if (mode === 'challenge' && userTackPoint && userJibePoint) {
+    body.user_tack_x = userTackPoint.x;
+    body.user_tack_y = userTackPoint.y;
+    body.user_jibe_x = userJibePoint.x;
+    body.user_jibe_y = userJibePoint.y;
   }
 
   try {
@@ -1018,7 +914,6 @@ async function fetchAndRun() {
     waypoints = data.waypoints;
     summary = data.summary;
     laylineData = summary.laylines || null;
-    windGridData = data.wind_grid || null;
 
     if (data.user_waypoints) {
       userWaypoints = data.user_waypoints;
@@ -1168,7 +1063,6 @@ function fetchLaylines() {
       });
       const data = await resp.json();
       laylineData = data.summary.laylines || null;
-      windGridData = data.wind_grid || null;
       if (simState === 'idle') drawCourse();
     } catch(e) {}
   }, 200);
@@ -1185,9 +1079,6 @@ randomizeCourse();
 setCourseControlsLocked(true);
 setSlidersVisible(false);
 $('newcourse-btn').style.display = '';
-phaseBtn.style.display = '';
-undoBtn.style.display = '';
-updatePhaseBtn();
 
 // Initial fetch
 fetchLaylines();
