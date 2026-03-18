@@ -210,7 +210,7 @@ def discretize_leg(start, end, heading_deg, tack, speed_kts, vmg_kts, dt, t_offs
     if speed_nm_per_s < 1e-10:
         return []
     leg_time = dist / speed_nm_per_s
-    n_steps = max(1, int(math.ceil(leg_time / dt)))
+    n_steps = min(max(1, int(math.ceil(leg_time / dt))), 5000)
     direction = (end - start) / dist
     waypoints = []
     for i in range(n_steps + 1):
@@ -290,6 +290,37 @@ def compute_leg_path(start, target, wind_from, tws, boat_type, dt, t_offset=0.0,
     }
 
 
+def compute_user_leg(start, via, end, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind"):
+    """Compute a user-defined two-segment leg: start -> via -> end."""
+    interp = get_interpolator(boat_type)
+    all_wps = []
+    total_dist = 0.0
+    t = t_offset
+
+    segments = [(start, via), (via, end)]
+    for seg_start, seg_end in segments:
+        diff = seg_end - seg_start
+        dist = float(np.linalg.norm(diff))
+        if dist < 1e-10:
+            continue
+        heading = math.degrees(math.atan2(diff[0], diff[1])) % 360
+        twa = abs(normalize_angle(heading - wind_from))
+        speed = get_boat_speed(tws, twa, interp)
+        cross = normalize_angle(heading - wind_from)
+        tack = "starboard" if cross > 0 else "port"
+        if speed < 0.5:
+            speed = 0.5
+        vmg = speed * math.cos(math.radians(twa))
+        wps = discretize_leg(seg_start, seg_end, heading, tack, speed, abs(vmg), dt, t, leg_name)
+        if wps:
+            all_wps.extend(wps)
+            t = wps[-1]["time"]
+            total_dist += dist
+
+    total_time = (all_wps[-1]["time"] - t_offset) if all_wps else 0.0
+    return {"waypoints": all_wps, "distance": total_dist, "time": total_time}
+
+
 def compute_full_course(body):
     boat_type = body.get("boat_type", "laser")
     tws = body.get("wind_speed", 12.0)
@@ -308,7 +339,17 @@ def compute_full_course(body):
     total_dist = up["distance"] + down["distance"]
     total_time = all_wps[-1]["time"] if all_wps else 0.0
 
-    return {
+    # Compute layline headings
+    up_twa = up["optimal_twa"]
+    dn_twa = down["optimal_twa"]
+    laylines = {
+        "upwind_sb": (wind_from + up_twa) % 360,
+        "upwind_port": (wind_from - up_twa) % 360,
+        "downwind_sb": (wind_from + dn_twa) % 360,
+        "downwind_port": (wind_from - dn_twa) % 360,
+    }
+
+    result = {
         "waypoints": all_wps,
         "summary": {
             "total_distance_nm": total_dist,
@@ -321,8 +362,29 @@ def compute_full_course(body):
             "downwind_vmg": down["optimal_vmg"],
             "downwind_speed": down["optimal_speed"],
             "n_jibes": down["n_maneuvers"],
+            "laylines": laylines,
         },
     }
+
+    # If user tack/jibe points provided, compute user path
+    if "user_tack_x" in body and "user_jibe_x" in body:
+        user_tack = np.array([body["user_tack_x"], body["user_tack_y"]])
+        user_jibe = np.array([body["user_jibe_x"], body["user_jibe_y"]])
+
+        u_up = compute_user_leg(start, user_tack, mark, wind_from, tws, boat_type, dt, t_offset=0.0, leg_name="upwind")
+        u_t_after = u_up["waypoints"][-1]["time"] if u_up["waypoints"] else 0.0
+        u_dn = compute_user_leg(mark, user_jibe, finish, wind_from, tws, boat_type, dt, t_offset=u_t_after, leg_name="downwind")
+
+        u_all_wps = u_up["waypoints"] + u_dn["waypoints"]
+        result["user_waypoints"] = u_all_wps
+        result["user_summary"] = {
+            "total_distance_nm": u_up["distance"] + u_dn["distance"],
+            "total_time_s": u_all_wps[-1]["time"] if u_all_wps else 0.0,
+            "n_tacks": 1,
+            "n_jibes": 1,
+        }
+
+    return result
 
 
 # ============================================================

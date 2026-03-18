@@ -526,7 +526,7 @@ def _discretize_leg(
         return []
 
     leg_time = dist / speed_nm_per_s
-    n_steps = max(1, int(math.ceil(leg_time / dt)))
+    n_steps = min(max(1, int(math.ceil(leg_time / dt))), 5000)
     direction = (end - start) / dist
 
     waypoints = []
@@ -541,6 +541,121 @@ def _discretize_leg(
             leg=leg,
         ))
     return waypoints
+
+
+def compute_user_leg(
+    start: np.ndarray, via: np.ndarray, end: np.ndarray,
+    wind_from: float, tws: float, boat_type: str, dt: float,
+    t_offset: float = 0.0, leg_name: str = "upwind",
+) -> SailingPath:
+    """Compute a user-defined two-segment leg: start -> via -> end.
+
+    Uses the actual heading's polar speed (not the VMG-optimal speed).
+    """
+    interp = get_interpolator(boat_type)
+    all_wps: list[Waypoint] = []
+    total_dist = 0.0
+    t = t_offset
+    n_tacks = 0
+
+    segments = [(start, via), (via, end)]
+    prev_tack = None
+
+    for seg_start, seg_end in segments:
+        diff = seg_end - seg_start
+        dist = float(np.linalg.norm(diff))
+        if dist < 1e-10:
+            continue
+
+        heading = math.degrees(math.atan2(diff[0], diff[1])) % 360
+        twa = abs(normalize_angle(heading - wind_from))
+        speed = get_boat_speed(tws, twa, interp)
+
+        # Determine tack
+        cross = normalize_angle(heading - wind_from)
+        tack = "starboard" if cross > 0 else "port"
+        if prev_tack is not None and tack != prev_tack:
+            n_tacks += 1
+        prev_tack = tack
+
+        if speed < 0.5:
+            # In or near the no-go zone — assign a minimum speed so the path renders
+            # but the time penalty is still very harsh
+            speed = 0.5
+
+        vmg = speed * math.cos(math.radians(twa))
+
+        wps = _discretize_leg(
+            seg_start, seg_end, heading, tack,
+            speed, abs(vmg), dt, t, leg_name,
+        )
+        if wps:
+            all_wps.extend(wps)
+            t = wps[-1].elapsed_seconds
+            total_dist += dist
+
+    total_time = (all_wps[-1].elapsed_seconds - t_offset) if all_wps else 0.0
+
+    # Get the optimal VMG for reference
+    diff_full = end - start
+    angle_off_wind = abs(normalize_angle(
+        math.degrees(math.atan2(diff_full[0], diff_full[1])) % 360 - wind_from
+    ))
+    if angle_off_wind <= 90:
+        opt_twa, opt_speed, opt_vmg = find_optimal_vmg(tws, interp)
+    else:
+        opt_twa, opt_speed, opt_vmg = find_optimal_downwind_vmg(tws, interp)
+
+    return SailingPath(
+        waypoints=all_wps,
+        total_distance_nm=total_dist,
+        total_time_seconds=total_time,
+        optimal_twa_deg=opt_twa,
+        optimal_vmg_kts=opt_vmg,
+        optimal_speed_kts=opt_speed,
+        n_tacks=n_tacks,
+        legs=[],
+    )
+
+
+def compute_user_course(
+    config: SimConfig,
+    user_tack_x: float, user_tack_y: float,
+    user_jibe_x: float, user_jibe_y: float,
+) -> dict:
+    """Compute a user-defined course through their chosen tack/jibe points."""
+    start = np.array([config.start_x, config.start_y])
+    mark = np.array([config.mark_x, config.mark_y])
+    finish = np.array([config.finish_x, config.finish_y])
+    user_tack = np.array([user_tack_x, user_tack_y])
+    user_jibe = np.array([user_jibe_x, user_jibe_y])
+
+    wind_from = config.wind_direction_deg
+    tws = config.wind_speed_kts
+
+    upwind = compute_user_leg(
+        start, user_tack, mark,
+        wind_from, tws, config.boat_type,
+        config.dt_seconds, t_offset=0.0, leg_name="upwind",
+    )
+
+    t_after_upwind = upwind.waypoints[-1].elapsed_seconds if upwind.waypoints else 0.0
+
+    downwind = compute_user_leg(
+        mark, user_jibe, finish,
+        wind_from, tws, config.boat_type,
+        config.dt_seconds, t_offset=t_after_upwind, leg_name="downwind",
+    )
+
+    all_waypoints = upwind.waypoints + downwind.waypoints
+
+    return {
+        "waypoints": all_waypoints,
+        "upwind": upwind,
+        "downwind": downwind,
+        "total_distance_nm": upwind.total_distance_nm + downwind.total_distance_nm,
+        "total_time_seconds": (upwind.total_time_seconds + downwind.total_time_seconds),
+    }
 
 
 def format_time(seconds: float) -> str:
@@ -571,14 +686,17 @@ body{background:#0a1628;color:#ccddee;font-family:'SF Mono',ui-monospace,'Cascad
 .ctrl label{font-size:11px;color:#6688aa;text-transform:uppercase;letter-spacing:0.5px}
 .ctrl select{background:#0d1f3c;color:#ccddee;border:1px solid #1a3355;
   border-radius:4px;padding:4px 8px;font-family:inherit;font-size:13px;cursor:pointer;min-width:80px}
-.ctrl input[type=range]{width:140px;cursor:pointer;accent-color:#44aaff;background:transparent;border:none}
+.ctrl input[type=range]{width:120px;cursor:pointer;accent-color:#44aaff;background:transparent;border:none}
 .ctrl .val{font-size:12px;color:#88bbdd;min-width:40px;text-align:right}
 .ctrl-row{display:flex;align-items:center;gap:6px}
-#simulate-btn{background:#1a5599;color:#eef;border:none;border-radius:6px;padding:8px 24px;
+.ctrl input[type=checkbox]{accent-color:#44aaff;cursor:pointer;width:16px;height:16px}
+.action-btn{border:none;border-radius:6px;padding:8px 24px;
   font-family:inherit;font-size:13px;cursor:pointer;font-weight:600;letter-spacing:0.5px;
   transition:background 0.15s}
+#simulate-btn{background:#1a5599;color:#eef}
 #simulate-btn:hover{background:#2266bb}
 #simulate-btn:active{background:#0e3d77}
+#reset-btn{background:#553322;color:#eef;display:none}
 #main{flex:1;position:relative;min-height:0}
 canvas{width:100%;height:100%;display:block}
 #info{position:absolute;top:12px;left:12px;background:rgba(10,22,40,0.85);
@@ -598,13 +716,32 @@ canvas{width:100%;height:100%;display:block}
 #finish-overlay{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
   font-size:28px;font-weight:700;color:#00ff88;pointer-events:none;opacity:0;
   text-shadow:0 0 20px rgba(0,255,136,0.4);transition:opacity 0.5s}
+#challenge-hint{font-size:11px;color:#88bbdd;max-width:200px;line-height:1.4}
+#score-panel{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  background:rgba(10,22,40,0.95);padding:24px 32px;border-radius:12px;border:1px solid #1a2a44;
+  text-align:center;pointer-events:none;z-index:10}
+#score-label{font-size:14px;color:#6688aa;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+#score-pct{font-size:48px;font-weight:700}
+#score-delta{font-size:16px;margin-top:8px}
+#score-times{font-size:12px;color:#6688aa;margin-top:12px}
 </style>
 </head>
 <body>
 <div id="controls">
   <div class="ctrl">
+    <label>Mode</label>
+    <select id="mode"><option value="simulate">Simulate</option><option value="challenge">Challenge</option></select>
+  </div>
+  <div class="ctrl">
     <label>Boat</label>
     <select id="boat"><option value="laser">Laser</option><option value="420">420</option><option value="j24">J/24</option></select>
+  </div>
+  <div class="ctrl">
+    <label>Wind Speed</label>
+    <div class="ctrl-row">
+      <input type="range" id="windSpeed" min="6" max="20" step="1" value="12">
+      <span class="val" id="windSpeedVal">12 kts</span>
+    </div>
   </div>
   <div class="ctrl">
     <label>Wind Direction</label>
@@ -634,8 +771,13 @@ canvas{width:100%;height:100%;display:block}
       <span class="val" id="finishXVal">0.15</span>
     </div>
   </div>
-  <button id="simulate-btn">Simulate</button>
-  <button id="reset-btn" style="display:none;background:#553322;color:#eef;border:none;border-radius:6px;padding:8px 24px;font-family:inherit;font-size:13px;cursor:pointer;font-weight:600;letter-spacing:0.5px">Reset</button>
+  <div class="ctrl">
+    <label>Laylines</label>
+    <input type="checkbox" id="showLaylines">
+  </div>
+  <button id="simulate-btn" class="action-btn">Simulate</button>
+  <button id="reset-btn" class="action-btn">Reset</button>
+  <div id="challenge-hint" style="display:none">Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.</div>
 </div>
 <div id="main">
   <canvas id="sim"></canvas>
@@ -663,27 +805,52 @@ canvas{width:100%;height:100%;display:block}
     </div>
   </div>
   <div id="finish-overlay"></div>
+  <div id="score-panel">
+    <div id="score-label">Tactics Score</div>
+    <div id="score-pct"></div>
+    <div id="score-delta"></div>
+    <div id="score-times"></div>
+  </div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 
 const canvas = $('sim');
 const ctx = canvas.getContext('2d');
-let waypoints = null, summary = null, frame = 0, animId = null;
 
-// --- State: 'idle' | 'running' | 'paused' | 'finished' ---
-let simState = 'idle';
-const controls = ['boat','windDir','startX','markX','finishX'];
+// --- Core state ---
+let waypoints = null, summary = null, animId = null;
+let simState = 'idle'; // 'idle' | 'running' | 'paused' | 'finished'
+
+// --- Challenge mode state ---
+let mode = 'simulate';
+let userTackPoint = null;   // {x, y} world coords
+let userJibePoint = null;   // {x, y} world coords
+let placingPoint = 'tack';  // 'tack' | 'jibe' | 'done'
+let userWaypoints = null;
+let userSummary = null;
+let laylineData = null;     // from server response
+
+// --- Animation state (time-based) ---
+let simElapsed = 0;
+let timeStep = 0;
+let maxTime = 0;
+let cachedBounds = null;
+
+const controls = ['boat','windSpeed','windDir','startX','markX','finishX','mode'];
 
 function setControlsEnabled(enabled) {
   for (const id of controls) {
-    $(id).disabled = !enabled;
-    $(id).closest('.ctrl').style.opacity = enabled ? '1' : '0.5';
+    const el = $(id);
+    el.disabled = !enabled;
+    const ctrl = el.closest('.ctrl');
+    if (ctrl) ctrl.style.opacity = enabled ? '1' : '0.5';
   }
 }
 
 // --- Slider live updates + course redraw ---
 for (const [id, valId, fmt] of [
+  ['windSpeed','windSpeedVal', v => v+' kts'],
   ['windDir','windDirVal', v => String(((+v)%360+360)%360).padStart(3,'0')+'°'],
   ['startX','startXVal', v => parseFloat(v).toFixed(2)],
   ['markX','markXVal', v => parseFloat(v).toFixed(2)],
@@ -691,10 +858,34 @@ for (const [id, valId, fmt] of [
 ]) {
   $(id).addEventListener('input', () => {
     $(valId).textContent = fmt($(id).value);
-    if (simState === 'idle') drawCourse();
+    if (simState === 'idle') { userTackPoint = null; userJibePoint = null; placingPoint = 'tack'; drawCourse(); }
   });
 }
 $('boat').addEventListener('change', () => {
+  if (simState === 'idle') drawCourse();
+});
+
+// --- Mode toggle ---
+$('mode').addEventListener('change', () => {
+  mode = $('mode').value;
+  if (mode === 'challenge') {
+    btn.textContent = 'Race';
+    $('challenge-hint').style.display = '';
+    userTackPoint = null;
+    userJibePoint = null;
+    placingPoint = 'tack';
+  } else {
+    btn.textContent = 'Simulate';
+    $('challenge-hint').style.display = 'none';
+    userTackPoint = null;
+    userJibePoint = null;
+  }
+  if (simState !== 'idle') goIdle();
+  else drawCourse();
+});
+
+// --- Layline toggle ---
+$('showLaylines').addEventListener('change', () => {
   if (simState === 'idle') drawCourse();
 });
 
@@ -707,7 +898,7 @@ function getParams() {
     finishX: parseFloat($('finishX').value),
     finishY: 0.0,
     windDir: ((parseFloat($('windDir').value) % 360) + 360) % 360,
-    windSpeed: 12,
+    windSpeed: parseInt($('windSpeed').value),
   };
 }
 
@@ -718,7 +909,7 @@ function resize() {
   canvas.height = r.height * devicePixelRatio;
   canvas.style.width = r.width + 'px';
   canvas.style.height = r.height + 'px';
-  if (waypoints) drawScene(Math.min(frame, waypoints.length - 1));
+  if (waypoints && simState !== 'idle') drawFrame();
   else drawCourse();
 }
 window.addEventListener('resize', resize);
@@ -730,11 +921,10 @@ function makeBounds(pts) {
     if (x < xMin) xMin = x; if (x > xMax) xMax = x;
     if (y < yMin) yMin = y; if (y > yMax) yMax = y;
   }
-  // Center the view: make x range symmetric around the midpoint
   const xMid = (xMin + xMax) / 2, yMid = (yMin + yMax) / 2;
   const halfX = (xMax - xMin) / 2, halfY = (yMax - yMin) / 2;
   const half = Math.max(halfX, halfY, 0.15);
-  const pad = 1.3; // 30% padding
+  const pad = 1.3;
   xMin = xMid - half * pad; xMax = xMid + half * pad;
   yMin = yMid - half * pad; yMax = yMid + half * pad;
   const range = Math.max(xMax - xMin, yMax - yMin);
@@ -750,7 +940,45 @@ function w2c(wx, wy, b) {
   ];
 }
 
-// --- Draw wind arrow (used by both course preview and animation) ---
+function c2w(cx, cy, b) {
+  return [
+    (cx - b.offsetX) / b.drawSize * b.range + b.xMin,
+    (canvas.height - cy - b.offsetY) / b.drawSize * b.range + b.yMin
+  ];
+}
+
+// --- Canvas click handler (Challenge mode point placement) ---
+canvas.addEventListener('click', (e) => {
+  if (mode !== 'challenge' || simState !== 'idle') return;
+  const p = getParams();
+  const allPts = [[p.startX, 0], [p.markX, p.markY], [p.finishX, p.finishY]];
+  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
+  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
+  const b = makeBounds(allPts);
+
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) * devicePixelRatio;
+  const cy = (e.clientY - rect.top) * devicePixelRatio;
+  const [wx, wy] = c2w(cx, cy, b);
+
+  if (placingPoint === 'tack') {
+    userTackPoint = {x: wx, y: wy};
+    placingPoint = 'jibe';
+    $('challenge-hint').innerHTML = 'Tack point set. Now click to place your <b>jibe point</b>.';
+  } else if (placingPoint === 'jibe') {
+    userJibePoint = {x: wx, y: wy};
+    placingPoint = 'done';
+    $('challenge-hint').innerHTML = 'Both points set. Hit <b>Race</b>! (Click canvas to re-place.)';
+  } else {
+    userTackPoint = {x: wx, y: wy};
+    userJibePoint = null;
+    placingPoint = 'jibe';
+    $('challenge-hint').innerHTML = 'Tack point re-placed. Now click to place your <b>jibe point</b>.';
+  }
+  drawCourse();
+});
+
+// --- Draw wind arrow ---
 function drawWindArrow(dir, speed) {
   const dpr = devicePixelRatio;
   const cw = canvas.width;
@@ -758,21 +986,17 @@ function drawWindArrow(dir, speed) {
   const arrowLen = 40 * dpr;
   const cx = cw - 55*dpr, cy = 55*dpr;
 
-  // Circle background
   ctx.strokeStyle = 'rgba(136,187,255,0.3)';
   ctx.lineWidth = 1.5*dpr;
   ctx.beginPath(); ctx.arc(cx, cy, arrowLen*0.65, 0, Math.PI*2); ctx.stroke();
 
-  // Arrow body: points in direction wind blows TO (opposite of FROM)
   const blowDx = -Math.sin(windRad), blowDy = -Math.cos(windRad);
-  // On canvas: +x is right, +y is down, so flip dy
   const ax1 = cx - blowDx*arrowLen*0.45, ay1 = cy + blowDy*arrowLen*0.45;
   const ax2 = cx + blowDx*arrowLen*0.45, ay2 = cy - blowDy*arrowLen*0.45;
   ctx.strokeStyle = '#88bbff';
   ctx.lineWidth = 2.5*dpr;
   ctx.beginPath(); ctx.moveTo(ax1,ay1); ctx.lineTo(ax2,ay2); ctx.stroke();
 
-  // Arrowhead
   const angle = Math.atan2(ay2-ay1, ax2-ax1);
   const hs = 10*dpr;
   ctx.beginPath();
@@ -782,7 +1006,6 @@ function drawWindArrow(dir, speed) {
   ctx.lineTo(ax2 - hs*Math.cos(angle+0.4), ay2 - hs*Math.sin(angle+0.4));
   ctx.stroke();
 
-  // Label
   ctx.fillStyle = '#88bbff';
   ctx.font = (11*dpr)+'px monospace';
   ctx.textAlign = 'center';
@@ -809,7 +1032,6 @@ function drawGrid(b) {
 // --- Draw all course marks ---
 function drawMarks(p, b) {
   const dpr = devicePixelRatio;
-  // Start (green circle)
   const [sx,sy] = w2c(p.startX, 0, b);
   ctx.fillStyle = '#00dd66';
   ctx.beginPath(); ctx.arc(sx, sy, 7*dpr, 0, Math.PI*2); ctx.fill();
@@ -818,7 +1040,6 @@ function drawMarks(p, b) {
   ctx.textAlign = 'center';
   ctx.fillText('START', sx, sy + 14*dpr);
 
-  // Upwind mark (orange diamond)
   const [mx,my] = w2c(p.markX, p.markY, b);
   ctx.fillStyle = '#ff8833';
   ctx.save();
@@ -831,7 +1052,6 @@ function drawMarks(p, b) {
   ctx.textAlign = 'center';
   ctx.fillText('MARK', mx, my - 12*dpr);
 
-  // Finish (checkered flag style - red square)
   const [fx,fy] = w2c(p.finishX, p.finishY, b);
   ctx.fillStyle = '#ff4466';
   ctx.beginPath(); ctx.arc(fx, fy, 7*dpr, 0, Math.PI*2); ctx.fill();
@@ -839,6 +1059,100 @@ function drawMarks(p, b) {
   ctx.font = (10*dpr)+'px monospace';
   ctx.textAlign = 'center';
   ctx.fillText('FINISH', fx, fy + 14*dpr);
+}
+
+// --- Draw laylines from mark ---
+function drawLaylines(b, p) {
+  if (!laylineData) return;
+  const dpr = devicePixelRatio;
+  const [mx, my] = w2c(p.markX, p.markY, b);
+  const lineLen = b.drawSize * 0.7;
+
+  // Upwind laylines (extend backward from mark toward start area)
+  for (const [key, color] of [['upwind_sb','rgba(0,255,136,0.25)'],['upwind_port','rgba(255,68,68,0.25)']]) {
+    const heading = laylineData[key];
+    const rad = heading * Math.PI / 180;
+    const ex = mx - Math.sin(rad) * lineLen;
+    const ey = my + Math.cos(rad) * lineLen;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2 * dpr;
+    ctx.setLineDash([8*dpr, 6*dpr]);
+    ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Downwind laylines from finish (extend from finish backward/upward)
+  const [fxc, fyc] = w2c(p.finishX, p.finishY, b);
+  for (const [key, color] of [['downwind_sb','rgba(0,255,136,0.15)'],['downwind_port','rgba(255,68,68,0.15)']]) {
+    const heading = laylineData[key];
+    const rad = heading * Math.PI / 180;
+    const ex = fxc + Math.sin(rad) * lineLen;
+    const ey = fyc - Math.cos(rad) * lineLen;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.setLineDash([6*dpr, 5*dpr]);
+    ctx.beginPath(); ctx.moveTo(fxc, fyc); ctx.lineTo(ex, ey); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+// --- Draw user-placed tack/jibe points ---
+function drawUserPoints(b) {
+  const dpr = devicePixelRatio;
+  if (userTackPoint) {
+    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
+    ctx.strokeStyle = '#44ddff';
+    ctx.lineWidth = 2*dpr;
+    const s = 8*dpr;
+    ctx.beginPath(); ctx.moveTo(tx-s,ty); ctx.lineTo(tx+s,ty); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(tx,ty-s); ctx.lineTo(tx,ty+s); ctx.stroke();
+    ctx.fillStyle = '#44ddff';
+    ctx.font = (10*dpr)+'px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOUR TACK', tx, ty - 12*dpr);
+  }
+  if (userJibePoint) {
+    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
+    ctx.strokeStyle = '#ffaa44';
+    ctx.lineWidth = 2*dpr;
+    const s = 8*dpr;
+    ctx.beginPath(); ctx.moveTo(jx-s,jy); ctx.lineTo(jx+s,jy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(jx,jy-s); ctx.lineTo(jx,jy+s); ctx.stroke();
+    ctx.fillStyle = '#ffaa44';
+    ctx.font = (10*dpr)+'px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOUR JIBE', jx, jy - 12*dpr);
+  }
+}
+
+// --- Draw proposed user path (dashed lines through their points) ---
+function drawUserProposedPath(b) {
+  const dpr = devicePixelRatio;
+  const p = getParams();
+  ctx.setLineDash([4*dpr, 4*dpr]);
+  ctx.lineWidth = 1.5*dpr;
+
+  if (userTackPoint) {
+    // start -> tack -> mark
+    ctx.strokeStyle = 'rgba(68,221,255,0.35)';
+    ctx.beginPath();
+    const [sx,sy] = w2c(p.startX, 0, b);
+    const [tx,ty] = w2c(userTackPoint.x, userTackPoint.y, b);
+    const [mx,my] = w2c(p.markX, p.markY, b);
+    ctx.moveTo(sx,sy); ctx.lineTo(tx,ty); ctx.lineTo(mx,my);
+    ctx.stroke();
+  }
+  if (userJibePoint) {
+    // mark -> jibe -> finish
+    ctx.strokeStyle = 'rgba(255,170,68,0.35)';
+    ctx.beginPath();
+    const [mx,my] = w2c(p.markX, p.markY, b);
+    const [jx,jy] = w2c(userJibePoint.x, userJibePoint.y, b);
+    const [fx,fy] = w2c(p.finishX, p.finishY, b);
+    ctx.moveTo(mx,my); ctx.lineTo(jx,jy); ctx.lineTo(fx,fy);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
 }
 
 // --- Course preview (no simulation, just marks + wind) ---
@@ -850,14 +1164,67 @@ function drawCourse() {
   ctx.fillStyle = '#0d1f3c';
   ctx.fillRect(0, 0, cw, ch);
 
-  const b = makeBounds([[p.startX, 0], [p.markX, p.markY], [p.finishX, p.finishY]]);
+  const allPts = [[p.startX, 0], [p.markX, p.markY], [p.finishX, p.finishY]];
+  if (userTackPoint) allPts.push([userTackPoint.x, userTackPoint.y]);
+  if (userJibePoint) allPts.push([userJibePoint.x, userJibePoint.y]);
+  const b = makeBounds(allPts);
   drawGrid(b);
+  if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
+  if (mode === 'challenge') {
+    drawUserProposedPath(b);
+    drawUserPoints(b);
+  }
   drawMarks(p, b);
   drawWindArrow(p.windDir, p.windSpeed);
 }
 
+// --- Find waypoint index by elapsed time ---
+function findIdxByTime(wps, t) {
+  if (!wps || wps.length === 0) return 0;
+  for (let i = wps.length - 1; i >= 0; i--) {
+    if (wps[i].time <= t) return i;
+  }
+  return 0;
+}
+
+// --- Draw a boat triangle ---
+function drawBoat(wx, wy, headingDeg, b, color, alpha) {
+  const dpr = devicePixelRatio;
+  const [bx,by] = w2c(wx, wy, b);
+  const headingRad = headingDeg * Math.PI / 180;
+  const bs = 10*dpr;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(bx, by);
+  ctx.rotate(headingRad);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, -bs);
+  ctx.lineTo(-bs*0.6, bs*0.5);
+  ctx.lineTo(bs*0.6, bs*0.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// --- Draw a path trail up to a given index ---
+function drawTrail(wps, upToIdx, b, color, dash) {
+  const dpr = devicePixelRatio;
+  if (!wps || upToIdx < 1) return;
+  ctx.setLineDash(dash.map(d => d*dpr));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2*dpr;
+  ctx.beginPath();
+  for (let i = 0; i <= Math.min(upToIdx, wps.length-1); i++) {
+    const [px,py] = w2c(wps[i].x, wps[i].y, b);
+    i === 0 ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
 // --- Full animation scene ---
-function drawScene(idx) {
+function drawFrame() {
   const dpr = devicePixelRatio;
   const cw = canvas.width, ch = canvas.height;
   const p = getParams();
@@ -865,17 +1232,23 @@ function drawScene(idx) {
   ctx.fillStyle = '#0d1f3c';
   ctx.fillRect(0, 0, cw, ch);
 
-  // Bounds from waypoints
+  // Build bounds from all waypoints
   const pts = waypoints.map(w => [w.x, w.y]);
+  if (userWaypoints) {
+    for (const uw of userWaypoints) pts.push([uw.x, uw.y]);
+  }
   pts.push([p.startX, 0], [p.markX, p.markY], [p.finishX, p.finishY]);
   const b = makeBounds(pts);
-  const wp = waypoints[idx];
+  cachedBounds = b;
 
   drawGrid(b);
+  if ($('showLaylines').checked && laylineData) drawLaylines(b, p);
 
-  // Planned path (dashed)
+  const isChallenge = mode === 'challenge' && userWaypoints;
+
+  // Optimal path (dashed preview line)
   ctx.setLineDash([6*dpr, 4*dpr]);
-  ctx.strokeStyle = 'rgba(68,85,102,0.5)';
+  ctx.strokeStyle = isChallenge ? 'rgba(68,85,102,0.3)' : 'rgba(68,85,102,0.5)';
   ctx.lineWidth = 1.5*dpr;
   ctx.beginPath();
   for (let i = 0; i < waypoints.length; i++) {
@@ -885,18 +1258,31 @@ function drawScene(idx) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Tack/jibe points and mark rounding
+  // User planned path (dashed)
+  if (isChallenge) {
+    ctx.setLineDash([4*dpr, 4*dpr]);
+    ctx.strokeStyle = 'rgba(68,221,255,0.2)';
+    ctx.lineWidth = 1.5*dpr;
+    ctx.beginPath();
+    for (let i = 0; i < userWaypoints.length; i++) {
+      const [px,py] = w2c(userWaypoints[i].x, userWaypoints[i].y, b);
+      i === 0 ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Tack/jibe annotations on optimal path
   for (let i = 1; i < waypoints.length; i++) {
-    // Leg transition (mark rounding)
     if (waypoints[i].leg !== waypoints[i-1].leg) {
       const [tx,ty] = w2c(waypoints[i].x, waypoints[i].y, b);
-      ctx.fillStyle = '#ff8833';
-      ctx.font = (10*dpr)+'px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('ROUNDING', tx, ty - 14*dpr);
-    }
-    // Tack or jibe within a leg
-    else if (waypoints[i].tack !== waypoints[i-1].tack) {
+      if (!isChallenge) {
+        ctx.fillStyle = '#ff8833';
+        ctx.font = (10*dpr)+'px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('ROUNDING', tx, ty - 14*dpr);
+      }
+    } else if (waypoints[i].tack !== waypoints[i-1].tack && !isChallenge) {
       const [tx,ty] = w2c(waypoints[i].x, waypoints[i].y, b);
       const isDownwind = waypoints[i].leg === 'downwind';
       ctx.strokeStyle = '#ffdd44';
@@ -914,26 +1300,39 @@ function drawScene(idx) {
   drawMarks(p, b);
   drawWindArrow(p.windDir, p.windSpeed);
 
-  // Boat triangle
-  const [bx,by] = w2c(wp.x, wp.y, b);
-  const headingRad = wp.heading * Math.PI / 180;
-  const bs = 10*dpr;
-  ctx.save();
-  ctx.translate(bx, by);
-  ctx.rotate(headingRad);
-  ctx.fillStyle = 'white';
-  ctx.beginPath();
-  ctx.moveTo(0, -bs);
-  ctx.lineTo(-bs*0.6, bs*0.5);
-  ctx.lineTo(bs*0.6, bs*0.5);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
+  // Find current waypoint indices by elapsed time
+  const optIdx = findIdxByTime(waypoints, simElapsed);
+  const optWp = waypoints[optIdx];
+
+  if (isChallenge) {
+    const userIdx = findIdxByTime(userWaypoints, simElapsed);
+    const userWp = userWaypoints[userIdx];
+
+    // Draw trails
+    drawTrail(waypoints, optIdx, b, 'rgba(150,180,220,0.3)', [4,3]);
+    drawTrail(userWaypoints, userIdx, b, 'rgba(68,221,255,0.4)', [0]);
+
+    // Ghost boat (optimal) - semi-transparent
+    drawBoat(optWp.x, optWp.y, optWp.heading, b, '#8899bb', 0.35);
+
+    // User boat - solid
+    drawBoat(userWp.x, userWp.y, userWp.heading, b, '#44ddff', 1.0);
+  } else {
+    // Single boat (simulate mode)
+    drawBoat(optWp.x, optWp.y, optWp.heading, b, 'white', 1.0);
+  }
+
+  // Update info panel — show user boat in challenge mode, optimal otherwise
+  if (isChallenge) {
+    const userIdx = findIdxByTime(userWaypoints, simElapsed);
+    updateInfo(userWaypoints[userIdx]);
+  } else {
+    updateInfo(optWp);
+  }
 }
 
 // --- Info panel ---
-function updateInfo(idx) {
-  const wp = waypoints[idx];
+function updateInfo(wp) {
   const wd = getParams().windDir;
   const twa = Math.abs(((wp.heading - wd) % 360 + 540) % 360 - 180);
   $('i-leg').textContent = wp.leg === 'downwind' ? 'Downwind' : 'Upwind';
@@ -963,8 +1362,7 @@ function fmtTime(s) {
   return m + ':' + String(sec).padStart(2,'0');
 }
 
-// --- Buttons: Simulate/Pause/Resume + Reset ---
-let stepsPerFrame = 1;
+// --- Buttons: Simulate/Race/Pause/Resume + Reset ---
 const btn = $('simulate-btn');
 const resetBtn = $('reset-btn');
 btn.addEventListener('click', handleBtn);
@@ -979,16 +1377,29 @@ function goIdle() {
   simState = 'idle';
   waypoints = null;
   summary = null;
-  btn.textContent = 'Simulate';
+  userWaypoints = null;
+  userSummary = null;
+  btn.textContent = mode === 'challenge' ? 'Race' : 'Simulate';
   resetBtn.style.display = 'none';
   setControlsEnabled(true);
   $('finish-overlay').style.opacity = '0';
+  $('score-panel').style.display = 'none';
   $('summary').style.display = 'none';
+  if (mode === 'challenge') {
+    userTackPoint = null;
+    userJibePoint = null;
+    placingPoint = 'tack';
+    $('challenge-hint').innerHTML = 'Click canvas to place your <b>tack point</b>, then <b>jibe point</b>. Then hit Race.';
+  }
   drawCourse();
 }
 
 function handleBtn() {
   if (simState === 'idle') {
+    if (mode === 'challenge' && (!userTackPoint || !userJibePoint)) {
+      $('challenge-hint').innerHTML = '<span style="color:#ff6666">Place both tack and jibe points first!</span>';
+      return;
+    }
     fetchAndRun();
   } else if (simState === 'running') {
     stopAnim();
@@ -1001,7 +1412,9 @@ function handleBtn() {
   } else if (simState === 'finished') {
     simState = 'running';
     btn.textContent = 'Pause';
-    frame = 0;
+    simElapsed = 0;
+    $('finish-overlay').style.opacity = '0';
+    $('score-panel').style.display = 'none';
     tickLoop();
   }
 }
@@ -1010,6 +1423,7 @@ async function fetchAndRun() {
   btn.textContent = '...';
   btn.disabled = true;
   $('finish-overlay').style.opacity = '0';
+  $('score-panel').style.display = 'none';
   setControlsEnabled(false);
   const p = getParams();
   const body = {
@@ -1022,6 +1436,14 @@ async function fetchAndRun() {
     finish_x: p.finishX,
     finish_y: p.finishY,
   };
+
+  if (mode === 'challenge' && userTackPoint && userJibePoint) {
+    body.user_tack_x = userTackPoint.x;
+    body.user_tack_y = userTackPoint.y;
+    body.user_jibe_x = userJibePoint.x;
+    body.user_jibe_y = userJibePoint.y;
+  }
+
   try {
     const resp = await fetch('/compute', {
       method: 'POST',
@@ -1031,6 +1453,17 @@ async function fetchAndRun() {
     const data = await resp.json();
     waypoints = data.waypoints;
     summary = data.summary;
+    laylineData = summary.laylines || null;
+
+    if (data.user_waypoints) {
+      userWaypoints = data.user_waypoints;
+      userSummary = data.user_summary;
+    } else {
+      userWaypoints = null;
+      userSummary = null;
+    }
+
+    // Populate summary panel (simulate mode or always)
     $('summary').style.display = 'block';
     $('s-up-twa').textContent = summary.upwind_twa.toFixed(1) + '°';
     $('s-up-vmg').textContent = summary.upwind_vmg.toFixed(1) + ' kts';
@@ -1040,6 +1473,7 @@ async function fetchAndRun() {
     $('s-jibes').textContent = summary.n_jibes;
     $('s-dist').textContent = summary.total_distance_nm.toFixed(3) + ' NM';
     $('s-time').textContent = fmtTime(summary.total_time_s);
+
     btn.disabled = false;
     resetBtn.style.display = '';
     startAnimation();
@@ -1052,32 +1486,106 @@ async function fetchAndRun() {
 
 function startAnimation() {
   stopAnim();
-  frame = 0;
+  simElapsed = 0;
   simState = 'running';
-  const targetWallMs = 20000;
-  stepsPerFrame = Math.max(1, Math.floor(waypoints.length / (targetWallMs / 16.67)));
+
+  // Determine max time across both paths
+  const optMaxTime = waypoints.length > 0 ? waypoints[waypoints.length-1].time : 0;
+  const userMaxTime = userWaypoints && userWaypoints.length > 0 ? userWaypoints[userWaypoints.length-1].time : 0;
+  maxTime = Math.max(optMaxTime, userMaxTime);
+
+  // Target ~20 seconds wall time at 60fps
+  const targetFrames = 20 * 60;
+  timeStep = maxTime / targetFrames;
+
   btn.textContent = 'Pause';
   tickLoop();
 }
 
 function tickLoop() {
   function tick() {
-    const idx = Math.min(frame, waypoints.length - 1);
-    drawScene(idx);
-    updateInfo(idx);
-    if (idx < waypoints.length - 1) {
-      frame += stepsPerFrame;
+    drawFrame();
+
+    if (simElapsed < maxTime) {
+      simElapsed += timeStep;
       animId = requestAnimationFrame(tick);
     } else {
+      simElapsed = maxTime;
+      drawFrame(); // final frame
       animId = null;
       simState = 'finished';
       btn.textContent = 'Replay';
-      $('finish-overlay').textContent = 'FINISHED  ' + fmtTime(summary.total_time_s);
-      $('finish-overlay').style.opacity = '1';
+
+      if (mode === 'challenge' && userSummary) {
+        showChallengeResults();
+      } else {
+        $('finish-overlay').textContent = 'FINISHED  ' + fmtTime(summary.total_time_s);
+        $('finish-overlay').style.opacity = '1';
+      }
     }
   }
   animId = requestAnimationFrame(tick);
 }
+
+function showChallengeResults() {
+  const optTime = summary.total_time_s;
+  const userTime = userSummary.total_time_s;
+  const score = Math.min(100, (optTime / userTime) * 100);
+  const delta = userTime - optTime;
+
+  $('score-pct').textContent = score.toFixed(1) + '%';
+  if (score >= 95) $('score-pct').style.color = '#00ff88';
+  else if (score >= 80) $('score-pct').style.color = '#ffdd44';
+  else $('score-pct').style.color = '#ff4444';
+
+  if (delta <= 0.5) {
+    $('score-delta').textContent = 'Perfect!';
+    $('score-delta').style.color = '#00ff88';
+  } else {
+    $('score-delta').textContent = '+' + Math.round(delta) + 's slower';
+    $('score-delta').style.color = '#ff8866';
+  }
+
+  $('score-times').textContent = 'Optimal: ' + fmtTime(optTime) + '  |  Yours: ' + fmtTime(userTime);
+  $('score-panel').style.display = '';
+}
+
+// --- Fetch laylines on settings change for preview ---
+let laylineFetchTimer = null;
+function fetchLaylines() {
+  clearTimeout(laylineFetchTimer);
+  laylineFetchTimer = setTimeout(async () => {
+    const p = getParams();
+    try {
+      const resp = await fetch('/compute', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          boat_type: $('boat').value,
+          wind_speed: p.windSpeed,
+          wind_direction: p.windDir,
+          start_x: p.startX,
+          mark_x: p.markX,
+          mark_y: p.markY,
+          finish_x: p.finishX,
+          finish_y: p.finishY,
+        }),
+      });
+      const data = await resp.json();
+      laylineData = data.summary.laylines || null;
+      if (simState === 'idle') drawCourse();
+    } catch(e) {}
+  }, 200);
+}
+
+// Fetch laylines whenever relevant controls change
+for (const id of ['windSpeed','windDir','startX','markX','finishX']) {
+  $(id).addEventListener('input', fetchLaylines);
+}
+$('boat').addEventListener('change', fetchLaylines);
+
+// Initial fetch
+fetchLaylines();
 
 // Initial draw
 resize();
@@ -1120,14 +1628,28 @@ class SimHandler(http.server.BaseHTTPRequestHandler):
             up = course["upwind"]
             down = course["downwind"]
 
-            result = {
-                "waypoints": [
+            # Compute layline headings from optimal TWA + wind
+            wind_dir = config.wind_direction_deg
+            up_twa = up.optimal_twa_deg
+            dn_twa = down.optimal_twa_deg
+            laylines = {
+                "upwind_sb": (wind_dir + up_twa) % 360,
+                "upwind_port": (wind_dir - up_twa) % 360,
+                "downwind_sb": (wind_dir + dn_twa) % 360,
+                "downwind_port": (wind_dir - dn_twa) % 360,
+            }
+
+            def serialize_waypoints(wps):
+                return [
                     {"x": wp.x, "y": wp.y, "heading": wp.heading_deg,
                      "tack": wp.tack, "speed": wp.speed_kts,
                      "vmg": wp.vmg_kts, "time": wp.elapsed_seconds,
                      "leg": wp.leg}
-                    for wp in course["waypoints"]
-                ],
+                    for wp in wps
+                ]
+
+            result = {
+                "waypoints": serialize_waypoints(course["waypoints"]),
                 "summary": {
                     "total_distance_nm": course["total_distance_nm"],
                     "total_time_s": course["total_time_seconds"],
@@ -1139,8 +1661,27 @@ class SimHandler(http.server.BaseHTTPRequestHandler):
                     "downwind_vmg": down.optimal_vmg_kts,
                     "downwind_speed": down.optimal_speed_kts,
                     "n_jibes": down.n_tacks,
+                    "laylines": laylines,
                 },
             }
+
+            # If user tack/jibe points provided, compute user path too
+            if "user_tack_x" in body and "user_jibe_x" in body:
+                user_course = compute_user_course(
+                    config,
+                    body["user_tack_x"], body["user_tack_y"],
+                    body["user_jibe_x"], body["user_jibe_y"],
+                )
+                u_up = user_course["upwind"]
+                u_dn = user_course["downwind"]
+                result["user_waypoints"] = serialize_waypoints(user_course["waypoints"])
+                result["user_summary"] = {
+                    "total_distance_nm": user_course["total_distance_nm"],
+                    "total_time_s": user_course["total_time_seconds"],
+                    "n_tacks": u_up.n_tacks,
+                    "n_jibes": u_dn.n_tacks,
+                }
+
             payload = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
