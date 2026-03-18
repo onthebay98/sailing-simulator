@@ -525,7 +525,7 @@ canvas{width:100%;height:100%;display:block}
 #info .sail-val{color:#44ddff}
 #info .stbd{color:#00ff88}
 #info .port{color:#ff4444}
-#summary{position:absolute;top:12px;right:12px;background:rgba(10,22,40,0.85);
+#summary{position:absolute;top:120px;right:12px;background:rgba(10,22,40,0.85);
   padding:10px 14px;border-radius:6px;border:1px solid #1a2a44;font-size:12px;
   line-height:1.6;pointer-events:none;min-width:200px}
 #summary .lbl{color:#6688aa}
