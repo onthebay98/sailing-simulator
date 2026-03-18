@@ -19,14 +19,15 @@ Single-file app (`sailing_sim.py`) organized into 7 sections:
 2. **Dataclasses** — `SimConfig` (frozen, includes `boat_type`), `WindState`, `Waypoint`, `SailingPath`
 3. **Polar Speed Model** — `LASER_POLAR_DATA` and `FOUR_TWENTY_POLAR_DATA` dicts, `BOAT_POLARS` registry, cached `RegularGridInterpolator` per boat type. TWS range 6-20 kts. No-go zone enforced by data.
 4. **Wind Model** — `make_wind_fn()` returns `(time, x, y) -> WindState`. Currently constant; hook for future variability.
-5. **VMG Optimizer & Path Planner** — Sweeps TWA to maximize `boat_speed * cos(TWA)`, solves tack geometry via 2×2 ray intersection. All functions take an `interp` parameter for boat-type polymorphism.
-6. **Embedded Web App** — `APP_HTML` string constant containing the full HTML/JS/CSS frontend. Canvas-based animation with controls (boat type, wind speed/direction, target position).
+5. **VMG Optimizer & Path Planner** — `find_optimal_vmg()` sweeps upwind TWA, `find_optimal_downwind_vmg()` sweeps downwind TWA. `compute_leg_path()` handles both upwind (tacking) and downwind (jibing) via 2×2 ray intersection. `compute_full_course()` chains upwind + downwind legs.
+6. **Embedded Web App** — `APP_HTML` string constant containing the full HTML/JS/CSS frontend. Canvas-based animation with controls (boat type, wind direction, start/mark/finish positions).
 7. **HTTP Server** — `SimHandler` serves `GET /` (HTML) and `POST /compute` (JSON path computation). Auto-opens browser on startup.
 
 ## Boat Types
 
-- **Laser**: Optimal VMG angle ~43-45°. Flat upwind polar but steeper than 420.
-- **420**: Optimal VMG angle ~40°. Flatter upwind polar (less speed gain from bearing off). Faster on reaches due to trapeze/spinnaker. Reflects real-world experience of sailing near pinching.
+- **Laser**: Upwind VMG angle ~44.5°, downwind ~144.5°. Moderate upwind polar.
+- **420**: Upwind VMG angle ~40°, downwind ~146°. Flatter upwind polar (less speed gain from bearing off). Faster on reaches due to trapeze/spinnaker.
+- **J/24**: Upwind VMG angle ~48°, downwind ~140°. Steeper upwind polar, heavier displacement keelboat.
 
 ## Coordinate Conventions
 
@@ -38,9 +39,9 @@ Single-file app (`sailing_sim.py`) organized into 7 sections:
 
 `POST /compute` with JSON body:
 ```json
-{"boat_type": "laser", "wind_speed": 12, "wind_direction": 0, "target_x": 0, "target_y": 1}
+{"boat_type": "laser", "wind_speed": 12, "wind_direction": 0, "start_x": 0, "mark_x": 0, "mark_y": 1, "finish_x": 0, "finish_y": 0}
 ```
-Returns `{"waypoints": [...], "summary": {...}}`.
+Returns `{"waypoints": [...], "summary": {...}}`. Course: start → upwind mark → finish (downwind).
 
 ## Planned Extensions
 
@@ -48,4 +49,3 @@ Returns `{"waypoints": [...], "summary": {...}}`.
 - Puffs (localized TWS increases, position-dependent)
 - Start line (line segment instead of single point)
 - Multiple boats / race simulation
-- Downwind legs
