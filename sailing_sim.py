@@ -1532,14 +1532,28 @@ function drawWindField(wg, b) {
       const [cx, cy] = w2c(wx, wy, b);
       const spd = speeds[i][j];
       const dir = directions[i][j];
-      const len = 18 * dpr * (spd / 15);
+      const spdNorm = Math.max(0, Math.min(1, (spd - 6) / 14)); // 0 at 6kts, 1 at 20kts
+      const len = dpr * (10 + 14 * spdNorm);
       const rad = dir * Math.PI / 180;
       // Downwind direction in canvas coords: (-sin(rad), +cos(rad))
       const dx = -Math.sin(rad) * len * 0.5;
       const dy = Math.cos(rad) * len * 0.5;
-      const alpha = 0.45 + 0.25 * (spd / 20);
-      ctx.strokeStyle = 'rgba(130,185,240,' + alpha + ')';
-      ctx.lineWidth = 1.8 * dpr;
+      // Color gradient: blue (light) -> white (mid) -> red (strong)
+      let r, g, bl;
+      if (spdNorm < 0.5) {
+        const t = spdNorm * 2; // 0..1 over first half
+        r = Math.round(80 + 175 * t);
+        g = Math.round(150 + 105 * t);
+        bl = Math.round(240 + 15 * t);
+      } else {
+        const t = (spdNorm - 0.5) * 2; // 0..1 over second half
+        r = 255;
+        g = Math.round(255 - 175 * t);
+        bl = Math.round(255 - 195 * t);
+      }
+      const alpha = 0.4 + 0.4 * spdNorm;
+      ctx.strokeStyle = 'rgba(' + r + ',' + g + ',' + bl + ',' + alpha + ')';
+      ctx.lineWidth = (1.0 + 1.4 * spdNorm) * dpr;
       ctx.beginPath();
       ctx.moveTo(cx - dx, cy - dy);
       ctx.lineTo(cx + dx, cy + dy);
