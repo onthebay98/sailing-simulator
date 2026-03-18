@@ -864,11 +864,32 @@ function fmtTime(s) {
   return m + ':' + String(sec).padStart(2,'0');
 }
 
-// --- Simulate button ---
-$('simulate-btn').addEventListener('click', simulate);
+// --- Simulate / Pause / Resume button ---
+let paused = false;
+let stepsPerFrame = 1;
+const btn = $('simulate-btn');
+btn.addEventListener('click', handleBtn);
 
-async function simulate() {
-  $('simulate-btn').textContent = '...';
+function handleBtn() {
+  if (animId && !paused) {
+    // Running → pause
+    cancelAnimationFrame(animId);
+    animId = null;
+    paused = true;
+    btn.textContent = 'Resume';
+  } else if (paused) {
+    // Paused → resume
+    paused = false;
+    btn.textContent = 'Pause';
+    tickLoop();
+  } else {
+    // Idle → new simulation
+    fetchAndRun();
+  }
+}
+
+async function fetchAndRun() {
+  btn.textContent = '...';
   $('finish-overlay').style.opacity = '0';
   const p = getParams();
   const body = {
@@ -898,15 +919,20 @@ async function simulate() {
   } catch(e) {
     console.error(e);
   }
-  $('simulate-btn').textContent = 'Simulate';
 }
 
 function startAnimation() {
   if (animId) cancelAnimationFrame(animId);
   frame = 0;
+  paused = false;
   $('finish-overlay').style.opacity = '0';
   const targetWallMs = 20000;
-  const stepsPerFrame = Math.max(1, Math.floor(waypoints.length / (targetWallMs / 16.67)));
+  stepsPerFrame = Math.max(1, Math.floor(waypoints.length / (targetWallMs / 16.67)));
+  btn.textContent = 'Pause';
+  tickLoop();
+}
+
+function tickLoop() {
   function tick() {
     const idx = Math.min(frame, waypoints.length - 1);
     drawScene(idx);
@@ -916,6 +942,8 @@ function startAnimation() {
       animId = requestAnimationFrame(tick);
     } else {
       animId = null;
+      paused = false;
+      btn.textContent = 'Simulate';
       $('finish-overlay').textContent = 'FINISHED  ' + fmtTime(summary.total_time_s);
       $('finish-overlay').style.opacity = '1';
     }
