@@ -1525,6 +1525,13 @@ function drawWindField(wg, b) {
   if (!wg) return;
   const dpr = devicePixelRatio;
   const {x_min, x_max, y_min, y_max, nx, ny, speeds, directions} = wg;
+  // Find actual min/max speed for relative color scaling
+  let sMin = Infinity, sMax = -Infinity;
+  for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) {
+    if (speeds[i][j] < sMin) sMin = speeds[i][j];
+    if (speeds[i][j] > sMax) sMax = speeds[i][j];
+  }
+  const sRange = sMax - sMin > 0.1 ? sMax - sMin : 1;
   for (let i = 0; i < nx; i++) {
     for (let j = 0; j < ny; j++) {
       const wx = x_min + (x_max - x_min) * i / (nx - 1);
@@ -1532,7 +1539,7 @@ function drawWindField(wg, b) {
       const [cx, cy] = w2c(wx, wy, b);
       const spd = speeds[i][j];
       const dir = directions[i][j];
-      const spdNorm = Math.max(0, Math.min(1, (spd - 6) / 14)); // 0 at 6kts, 1 at 20kts
+      const spdNorm = (spd - sMin) / sRange; // 0 at lightest, 1 at strongest
       const len = dpr * (10 + 14 * spdNorm);
       const rad = dir * Math.PI / 180;
       // Downwind direction in canvas coords: (-sin(rad), +cos(rad))
