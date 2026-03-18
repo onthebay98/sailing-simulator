@@ -542,13 +542,6 @@ canvas{width:100%;height:100%;display:block}
     <select id="boat"><option value="laser">Laser</option><option value="420">420</option><option value="j24">J/24</option></select>
   </div>
   <div class="ctrl">
-    <label>Wind Speed</label>
-    <div class="ctrl-row">
-      <input type="range" id="windSpeed" min="6" max="20" step="1" value="12">
-      <span class="val" id="windSpeedVal">12 kts</span>
-    </div>
-  </div>
-  <div class="ctrl">
     <label>Wind Direction</label>
     <div class="ctrl-row">
       <input type="range" id="windDir" min="0" max="359" step="1" value="0">
@@ -560,13 +553,6 @@ canvas{width:100%;height:100%;display:block}
     <div class="ctrl-row">
       <input type="range" id="startX" min="-0.5" max="0.5" step="0.05" value="0">
       <span class="val" id="startXVal">0.00</span>
-    </div>
-  </div>
-  <div class="ctrl">
-    <label>Mark Distance</label>
-    <div class="ctrl-row">
-      <input type="range" id="markY" min="0.3" max="2.0" step="0.1" value="1.0">
-      <span class="val" id="markYVal">1.00 NM</span>
     </div>
   </div>
   <button id="simulate-btn">Simulate</button>
@@ -600,7 +586,7 @@ let waypoints = null, summary = null, frame = 0, animId = null;
 
 // --- State: 'idle' | 'running' | 'paused' | 'finished' ---
 let simState = 'idle';
-const controls = ['boat','windSpeed','windDir','startX','markY'];
+const controls = ['boat','windDir','startX'];
 
 function setControlsEnabled(enabled) {
   for (const id of controls) {
@@ -612,10 +598,8 @@ function setControlsEnabled(enabled) {
 
 // --- Slider live updates + course redraw ---
 for (const [id, valId, fmt] of [
-  ['windSpeed','windSpeedVal', v => v+' kts'],
   ['windDir','windDirVal', v => String(v).padStart(3,'0')+'°'],
   ['startX','startXVal', v => parseFloat(v).toFixed(2)],
-  ['markY','markYVal', v => parseFloat(v).toFixed(2)+' NM'],
 ]) {
   $(id).addEventListener('input', () => {
     $(valId).textContent = fmt($(id).value);
@@ -630,9 +614,9 @@ $('boat').addEventListener('change', () => {
 function getParams() {
   return {
     startX: parseFloat($('startX').value),
-    markY: parseFloat($('markY').value),
+    markY: 1.0,
     windDir: parseFloat($('windDir').value),
-    windSpeed: parseFloat($('windSpeed').value),
+    windSpeed: 12,
   };
 }
 
@@ -769,7 +753,7 @@ function drawCourse() {
   const b = makeBounds([[p.startX, 0], [0, p.markY]]);
   drawGrid(b);
   drawMarks(p.startX, p.markY, b);
-  drawWindArrow(p.windDir, $('windSpeed').value);
+  drawWindArrow(p.windDir, p.windSpeed);
 }
 
 // --- Full animation scene ---
@@ -818,7 +802,7 @@ function drawScene(idx) {
   }
 
   drawMarks(p.startX, p.markY, b);
-  drawWindArrow(p.windDir, $('windSpeed').value);
+  drawWindArrow(p.windDir, p.windSpeed);
 
   // Wake trail
   const trailStart = Math.max(0, idx - 300);
