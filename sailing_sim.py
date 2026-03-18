@@ -696,7 +696,7 @@ canvas{width:100%;height:100%;display:block}
 #info .sail-val{color:#44ddff}
 #info .stbd{color:#00ff88}
 #info .port{color:#ff4444}
-#summary{position:absolute;top:120px;right:12px;background:rgba(10,22,40,0.85);
+#summary{position:absolute;top:12px;right:12px;background:rgba(10,22,40,0.85);
   padding:10px 14px;border-radius:6px;border:1px solid #1a2a44;font-size:12px;
   line-height:1.6;pointer-events:none;min-width:200px}
 #summary .lbl{color:#6688aa}
@@ -1050,13 +1050,15 @@ canvas.addEventListener('click', (e) => {
 });
 
 // --- Draw wind arrow ---
-function drawWindArrow(dir, speed) {
+function drawWindArrow(dir, speed, bounds) {
   const dpr = devicePixelRatio;
   const cw = canvas.width;
   const ch = canvas.height;
   const windRad = dir * Math.PI / 180;
   const arrowLen = 40 * dpr;
-  const cx = cw - 55*dpr, cy = ch * 0.4;
+  // Position at top-right of the course area
+  const cx = bounds ? (bounds.offsetX + bounds.drawSize - 30*dpr) : (cw - 55*dpr);
+  const cy = bounds ? (bounds.offsetY + 40*dpr) : (ch * 0.4);
 
   ctx.strokeStyle = 'rgba(136,187,255,0.3)';
   ctx.lineWidth = 1.5*dpr;
@@ -1247,7 +1249,7 @@ function drawCourse() {
     drawUserPoints(b);
   }
   drawMarks(p, b);
-  drawWindArrow(p.windDir, p.windSpeed);
+  drawWindArrow(p.windDir, p.windSpeed, b);
 }
 
 // --- Interpolate waypoint at a given elapsed time ---
@@ -1394,7 +1396,7 @@ function drawFrame() {
   }
 
   drawMarks(p, b);
-  drawWindArrow(p.windDir, p.windSpeed);
+  drawWindArrow(p.windDir, p.windSpeed, b);
 
   // Interpolate current positions (challenge uses independent clocks)
   const optT = isChallenge ? optElapsed : simElapsed;
