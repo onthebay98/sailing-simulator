@@ -617,8 +617,8 @@ canvas{width:100%;height:100%;display:block}
   <div class="ctrl">
     <label>Start</label>
     <div class="ctrl-row">
-      <input type="range" id="startX" min="-0.5" max="0.5" step="0.05" value="0">
-      <span class="val" id="startXVal">0.00</span>
+      <input type="range" id="startX" min="-0.5" max="0.5" step="0.05" value="-0.15">
+      <span class="val" id="startXVal">-0.15</span>
     </div>
   </div>
   <div class="ctrl">
@@ -631,11 +631,12 @@ canvas{width:100%;height:100%;display:block}
   <div class="ctrl">
     <label>Finish</label>
     <div class="ctrl-row">
-      <input type="range" id="finishX" min="-0.5" max="0.5" step="0.05" value="0">
-      <span class="val" id="finishXVal">0.00</span>
+      <input type="range" id="finishX" min="-0.5" max="0.5" step="0.05" value="0.15">
+      <span class="val" id="finishXVal">0.15</span>
     </div>
   </div>
   <button id="simulate-btn">Simulate</button>
+  <button id="reset-btn" style="display:none;background:#553322;color:#eef;border:none;border-radius:6px;padding:8px 24px;font-family:inherit;font-size:13px;cursor:pointer;font-weight:600;letter-spacing:0.5px">Reset</button>
 </div>
 <div id="main">
   <canvas id="sim"></canvas>
@@ -678,8 +679,8 @@ const controls = ['boat','windDir','startX','markX','finishX'];
 function setControlsEnabled(enabled) {
   for (const id of controls) {
     $(id).disabled = !enabled;
+    $(id).closest('.ctrl').style.opacity = enabled ? '1' : '0.5';
   }
-  $('controls').style.opacity = enabled ? '1' : '0.5';
 }
 
 // --- Slider live updates + course redraw ---
@@ -914,26 +915,13 @@ function drawScene(idx) {
   drawMarks(p, b);
   drawWindArrow(p.windDir, p.windSpeed);
 
-  // Wake trail
-  const trailStart = Math.max(0, idx - 300);
-  if (idx > 0) {
-    ctx.strokeStyle = 'rgba(68,221,255,0.4)';
-    ctx.lineWidth = 2*dpr;
-    ctx.beginPath();
-    for (let i = trailStart; i <= idx; i++) {
-      const [px,py] = w2c(waypoints[i].x, waypoints[i].y, b);
-      i === trailStart ? ctx.moveTo(px,py) : ctx.lineTo(px,py);
-    }
-    ctx.stroke();
-  }
-
   // Boat triangle
   const [bx,by] = w2c(wp.x, wp.y, b);
-  const headingRad = (90 - wp.heading) * Math.PI / 180;
+  const headingRad = wp.heading * Math.PI / 180;
   const bs = 10*dpr;
   ctx.save();
   ctx.translate(bx, by);
-  ctx.rotate(-headingRad);
+  ctx.rotate(headingRad);
   ctx.fillStyle = 'white';
   ctx.beginPath();
   ctx.moveTo(0, -bs);
@@ -976,10 +964,12 @@ function fmtTime(s) {
   return m + ':' + String(sec).padStart(2,'0');
 }
 
-// --- Button: Simulate / Pause / Restart ---
+// --- Buttons: Simulate/Pause/Resume + Reset ---
 let stepsPerFrame = 1;
 const btn = $('simulate-btn');
+const resetBtn = $('reset-btn');
 btn.addEventListener('click', handleBtn);
+resetBtn.addEventListener('click', goIdle);
 
 function stopAnim() {
   if (animId) { cancelAnimationFrame(animId); animId = null; }
@@ -991,6 +981,7 @@ function goIdle() {
   waypoints = null;
   summary = null;
   btn.textContent = 'Simulate';
+  resetBtn.style.display = 'none';
   setControlsEnabled(true);
   $('finish-overlay').style.opacity = '0';
   $('summary').style.display = 'none';
@@ -1009,7 +1000,10 @@ function handleBtn() {
     btn.textContent = 'Pause';
     tickLoop();
   } else if (simState === 'finished') {
-    goIdle();
+    simState = 'running';
+    btn.textContent = 'Pause';
+    frame = 0;
+    tickLoop();
   }
 }
 
@@ -1048,6 +1042,7 @@ async function fetchAndRun() {
     $('s-dist').textContent = summary.total_distance_nm.toFixed(3) + ' NM';
     $('s-time').textContent = fmtTime(summary.total_time_s);
     btn.disabled = false;
+    resetBtn.style.display = '';
     startAnimation();
   } catch(e) {
     console.error(e);
@@ -1077,7 +1072,7 @@ function tickLoop() {
     } else {
       animId = null;
       simState = 'finished';
-      btn.textContent = 'Reset';
+      btn.textContent = 'Replay';
       $('finish-overlay').textContent = 'FINISHED  ' + fmtTime(summary.total_time_s);
       $('finish-overlay').style.opacity = '1';
     }
