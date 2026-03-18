@@ -1073,6 +1073,15 @@ canvas{width:100%;height:100%;display:block}
 #info .sail-val{color:#44ddff}
 #info .stbd{color:#00ff88}
 #info .port{color:#ff4444}
+#guide{position:absolute;bottom:12px;left:12px;background:rgba(10,22,40,0.85);
+  padding:10px 14px;border-radius:6px;border:1px solid #1a2a44;font-size:11px;
+  line-height:1.6;pointer-events:none;max-width:210px;color:#88aabb}
+#guide b{color:#ccddee;font-weight:600}
+#guide .g-row{display:flex;align-items:center;gap:6px;margin:2px 0}
+#guide .g-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+#guide .g-dia{width:8px;height:8px;transform:rotate(45deg);flex-shrink:0}
+#guide .g-sep{border-top:1px solid #1a2a44;margin:6px 0}
+#guide .g-title{color:#6688aa;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px}
 #summary{position:absolute;top:12px;right:12px;background:rgba(10,22,40,0.85);
   padding:10px 14px;border-radius:6px;border:1px solid #1a2a44;font-size:12px;
   line-height:1.6;pointer-events:none;min-width:200px}
@@ -1089,6 +1098,29 @@ canvas{width:100%;height:100%;display:block}
 #score-pct{font-size:48px;font-weight:700}
 #score-delta{font-size:16px;margin-top:8px}
 #score-times{font-size:12px;color:#6688aa;margin-top:12px}
+#help-btn{position:absolute;bottom:16px;right:16px;width:36px;height:36px;border-radius:50%;
+  border:1px solid #2a4466;background:rgba(10,22,40,0.85);color:#88bbdd;font-size:18px;
+  cursor:pointer;z-index:20;display:flex;align-items:center;justify-content:center;
+  font-family:inherit;font-weight:700;transition:background 0.15s}
+#help-btn:hover{background:rgba(30,60,100,0.9)}
+#welcome{position:fixed;inset:0;background:rgba(5,12,25,0.92);z-index:100;
+  display:flex;align-items:center;justify-content:center}
+#welcome-box{background:#0d1f3c;border:1px solid #1a3355;border-radius:12px;
+  padding:32px 36px;max-width:520px;width:90%;color:#ccddee;font-size:13px;line-height:1.7;
+  max-height:90vh;overflow-y:auto}
+#welcome-box h1{font-size:20px;color:#fff;margin-bottom:4px;font-weight:700}
+#welcome-box h2{font-size:11px;color:#6688aa;text-transform:uppercase;letter-spacing:1px;
+  margin:16px 0 6px;font-weight:600}
+#welcome-box .legend-row{display:flex;align-items:center;gap:10px;margin:4px 0}
+#welcome-box .dot{width:12px;height:12px;border-radius:50%;flex-shrink:0}
+#welcome-box .diamond{width:12px;height:12px;transform:rotate(45deg);flex-shrink:0}
+#welcome-box .arrow-sample{display:inline-block;width:40px;text-align:center;flex-shrink:0}
+#welcome-box .btn-row{text-align:center;margin-top:20px}
+#welcome-box .go-btn{background:#1a5599;color:#eef;border:none;border-radius:6px;
+  padding:10px 32px;font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;
+  letter-spacing:0.5px;transition:background 0.15s}
+#welcome-box .go-btn:hover{background:#2266bb}
+#welcome-box .sub{color:#6688aa;font-size:11px}
 </style>
 </head>
 <body>
@@ -1193,12 +1225,36 @@ canvas{width:100%;height:100%;display:block}
       <div><span class="lbl">Total Time: </span><span class="val" id="s-time"></span></div>
     </div>
   </div>
+  <div id="guide">
+    <div class="g-title">Course</div>
+    <div class="g-row"><span class="g-dot" style="background:#00dd66"></span> Start</div>
+    <div class="g-row"><span class="g-dia" style="background:#ff8833"></span> Upwind mark</div>
+    <div class="g-row"><span class="g-dot" style="background:#ff4466"></span> Finish</div>
+    <div class="g-sep"></div>
+    <div class="g-title">Wind</div>
+    <div class="g-row"><span style="color:#5096f0">&#8594;</span> Light &nbsp; <span style="color:#ff5038">&#8594;</span> Strong</div>
+    <div class="g-sep"></div>
+    <div class="g-title">Challenge</div>
+    <div><b>Click</b> to place waypoints</div>
+    <div><b>Upwind/Downwind</b> to switch leg</div>
+    <div><b>Undo</b> to remove last point</div>
+    <div><b>Race</b> to start</div>
+  </div>
   <div id="finish-overlay"></div>
   <div id="score-panel">
     <div id="score-label">Tactics Score</div>
     <div id="score-pct"></div>
     <div id="score-delta"></div>
     <div id="score-times"></div>
+  </div>
+  <button id="help-btn">?</button>
+</div>
+<div id="welcome">
+  <div id="welcome-box">
+    <h1>Sailing Simulator</h1>
+    <p>A sailboat can't sail directly into the wind &mdash; it must zigzag. Pick your route through varying wind and race the computer's optimal path.</p>
+    <p style="margin-top:8px">Click the course to place waypoints, then hit <b>Race</b>. See the guide panel (bottom-left) for details.</p>
+    <div class="btn-row"><button class="go-btn" id="welcome-go">Got it</button></div>
   </div>
 </div>
 <script>
@@ -2255,6 +2311,16 @@ fetchLaylines();
 
 // Initial draw
 resize();
+
+// --- Welcome overlay ---
+const welcomeEl = $('welcome');
+const helpBtn = $('help-btn');
+function showWelcome() { welcomeEl.style.display = 'flex'; }
+function hideWelcome() { welcomeEl.style.display = 'none'; localStorage.setItem('sailing-sim-seen', '1'); }
+$('welcome-go').addEventListener('click', hideWelcome);
+welcomeEl.addEventListener('click', (e) => { if (e.target === welcomeEl) hideWelcome(); });
+helpBtn.addEventListener('click', showWelcome);
+if (localStorage.getItem('sailing-sim-seen')) welcomeEl.style.display = 'none';
 </script>
 </body>
 </html>"""
