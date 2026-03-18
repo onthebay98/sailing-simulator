@@ -1,0 +1,15 @@
+{
+  "framework": null,
+  "cleanUrls": true,
+  "functions": {
+    "api/compute.py": {
+      "maxDuration": 10
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/public/$1"
+    }
+  ]
+}
